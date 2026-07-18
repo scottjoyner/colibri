@@ -40,6 +40,7 @@ brightness is routing heat, and every expert routed in a turn flashes white. Hov
 - [What's implemented](#whats-implemented)
 - [Honest numbers](#honest-numbers-wsl2-12-cores-25-gb-ram-nvme-via-vhdx)
 - [Download the model](#download-the-model)
+- [OpenAI-compatible provider mode](#openai-compatible-provider-mode)
 - [Web dashboard](#web-dashboard)
 - [Got a better machine?](#got-a-better-machine-try-it--heres-what-to-expect)
 
@@ -162,6 +163,17 @@ report uses stable check IDs for automation. Warnings keep exit status 0; missin
 requirements or an unsafe RAM projection return 1, while invalid CLI values return 2.
 
 The engine at runtime is pure C — python is only used by the one-time converter.
+
+## OpenAI-compatible provider mode
+
+Colibrì includes an OpenAI-compatible HTTP server via `c/openai_server.py` and
+`coli serve`; clients should use the `/v1` base URL. For a documented local
+GLM-5.2 provider profile, smoke tests, Hermes custom-provider config, and a
+systemd user-service template, see [docs/GLM52-OPENAI-PROVIDER.md](docs/GLM52-OPENAI-PROVIDER.md).
+
+On Scott's Vulkan/iGPU branch, provider mode should use the stable Phase 2 MoE
+backend (`COLI_CUDA=1`) and keep experimental dense/attention Vulkan routing off
+until the attention kernel is separately validated.
 
 ### Windows 11 (native, no WSL)
 
