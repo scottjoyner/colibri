@@ -2,7 +2,7 @@
 
 This repo already includes an OpenAI-compatible HTTP server in `c/openai_server.py`, exposed through `c/coli serve`. Use that before writing any separate shim.
 
-This document records the currently verified provider profile for Scott's local GLM-5.2 colibri model on the Vulkan/iGPU branch.
+This document records the currently verified provider profile for Scott's local GLM-5.2 colibri model on the Vulkan/iGPU branch. This model is for manual/offline emergency capability and supervised benchmarking only; do not wire it into unsupervised agent routing.
 
 ## Model and repo paths
 
@@ -167,20 +167,20 @@ providers:
     api_key: local-glm52
 ```
 
-Then start a new Hermes session and use:
+Then start a new Hermes session and use manually only when Scott explicitly wants to test or operate this model:
 
 ```bash
 hermes chat --provider glm52-local --model glm-5.2-colibri-vulkan
 ```
 
-or set it as default:
+Do not set it as an agent default. If Scott explicitly wants a temporary manual emergency/offline profile, it can be selected deliberately:
 
 ```bash
 hermes config set model.provider glm52-local
 hermes config set model.default glm-5.2-colibri-vulkan
 ```
 
-Restart Hermes after provider changes.
+Restart Hermes after provider changes, and revert defaults after the emergency/test window.
 
 ## Generic OpenAI-compatible client config
 
