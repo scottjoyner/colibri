@@ -207,13 +207,29 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
+# VULKAN=1 adds a backend for any Vulkan GPU (Radeon 890M / Intel Arc / nvk / ...).
+# It implements the SAME coli_cuda_* ABI as backend_cuda.cu, so glm.c's existing
+# #ifdef COLI_CUDA dispatch is reused unchanged — no engine edits. We define
+# COLI_CUDA (to activate the dispatch) and link backend_vulkan.c instead of the
+# .cu. Shaders are compiled at init via glslangValidator (dev build).
+VULKAN    ?= 0
+VULKAN_OBJ =
+ifeq ($(VULKAN),1)
+ifneq (,$(DARWIN))
+$(error VULKAN=1 is supported only on Linux/Windows)
+endif
+CFLAGS   += -DCOLI_CUDA
+LDFLAGS  += -lvulkan -lpthread
+VULKAN_OBJ = backend_vulkan.o
+endif
+
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
-glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
+glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ)
+	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h
@@ -234,6 +250,9 @@ cuda-dll: backend_cuda.cu backend_cuda.h
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
+
+backend_vulkan.o: backend_vulkan.c backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
