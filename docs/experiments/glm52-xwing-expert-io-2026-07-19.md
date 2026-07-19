@@ -137,13 +137,48 @@ page faults, no contended copy-from-cache — just a RAM-to-RAM memcpy.
   the 2.5 GB cache reserve buys ~nothing (cap 1→2, tok/s flat).
 - **Fewer OMP threads:** slows the matmul, no net gain (bus still contended).
 
+### The "offload compute to the 8050S iGPU" lever — MEASURED: it is a REGRESSION
+
+The iGPU Vulkan path (`backend_vulkan.c`) already implements int4 matmul
+(`S_MATMUL`), per-expert `expert_mlp`, the 1-submit/layer `expert_group`
+batch, and PATH-2 attention. So I tested offloading onto the 8050S:
+
+| config | tok/s | attention (decode) | expert-matmul (decode) | notes |
+|---|---|---|---|---|
+| `COLI_CUDA_ATTN=1` (attention absorb only, experts **CPU**) | **0.35** | 1.4s | 2.4s | the peak — CPU is fast |
+| `COLI_CUDA=1` `CUDA_EXPERT_GB=auto` (dense+attn+expert all GPU) | 0.17 | 6.6s | 21.1s | **2× slower** |
+| `COLI_CUDA=1` (dense+attn GPU, **no** expert tier) | 0.18 | 5.7s | 20.2s | still 2× slower |
+
+**Why offload loses on xwing:**
+1. **The 8050S iGPU compute is far weaker than the Zen5 CPU** for these
+   int4 GEMMs. `expert-matmul` went 2.4s (CPU) → 21.1s (iGPU) — **9× slower**.
+   The per-expert / per-layer `vkQueueSubmit`+`vkWaitForFences` overhead
+   dominates for hundreds of tiny GEMMs (the fused-pipeline effort was
+   abandoned for exactly this reason: 0.09–0.11 tok/s).
+2. **Unified memory means the iGPU shares the SAME RAM channel** — it does
+   NOT free a separate bandwidth channel for the expert `pread`s. So moving
+   compute to the iGPU just moves the bottleneck, it doesn't remove the
+   CPU↔I/O contention, and adds a slower compute path on top.
+
+**Conclusion: the iGPU is NOT a win on this box.** `COLI_CUDA_ATTN=1`
+(attention absorb on GPU, everything else CPU) is the correct, fastest config
+— matching the committed guidance. The dense q/k/v/o projections, rmsnorm,
+RoPE and the shared expert correctly stay on CPU (their Vulkan `pipe_*`
+counterparts are stubs / slower).
+
+The only scenario where GPU offload helps is a box with **fast, separate
+VRAM + a strong dGPU** (the 6×RTX-5090 lab: 6.28 tok/s). On
+unified-memory APUs where the CPU is the fast compute, keep compute on CPU.
+
 ### The real remaining lever on xwing
 The 23× is unified-APU bus contention between dense matmul and expert I/O.
-The only architectural fix that moves it is **offloading the dense/expert matmul to
-the 8050S iGPU via the Vulkan backend** (freeing CPU memory bandwidth for
-the expert `pread`s). That is the whole `backend_vulkan.c` MoE path — explored
-earlier (the fused pipeline was broken/slow on this APU); it remains the
-highest-value deep change but is a backend project, not an I/O tweak.
+Since (a) the iGPU is slower than the CPU here, and (b) unified memory
+means offload doesn't free the contested channel, there is **no compute-side
+win available on this hardware.** The only escapes:
+- **More RAM** (the 96 GB HX 370): model stays resident → no cold reads
+  → the 23× tax vanishes on CPU alone, and `COLI_FILECACHE=1` (with
+  `ulimit -l unlimited`/root) pins it to kill it entirely.
+- **Faster storage** for the cold-read tail (marginal — raw NVMe is already 5–8 GB/s).
 
 ## Cross-box note (HX 370, 96 GB)
 The user's *other* Strix Halo machine has 96 GB. Same architecture → every
@@ -153,7 +188,14 @@ change here applies, and the optimum flips:
   tax, drives residency → 100%, and keeps `MTP_AUTO` *on*.
 - Much larger RAM → the 2.5 GB `pc_b` reserve and dense 12 GB leave ~70 GB
   for expert residency; `cap`/`PC_GB` raise hit rate directly.
-- The Vulkan iGPU matmul offload (above) helps both boxes equally.
+- **The Vulkan iGPU matmul offload does NOT help on xwing** (measured:
+  `COLI_CUDA=1` = 0.17–0.18 tok/s vs `COLI_CUDA_ATTN=1` = 0.35;
+  the 8050S iGPU is 9× *slower* than the Zen5 CPU for int4 GEMM
+  and unified memory means offload never frees the contested channel).
+  On a box with **fast separate VRAM + strong dGPU** (the 6×RTX-5090
+  lab: 6.28 tok/s) it IS the win — but that is not this APU's
+  topology. Keep `COLI_CUDA_ATTN=1` (attention absorb only) as the
+  xwing default; full `COLI_CUDA=1` is a regression here.
 
 ## Env reference (added)
 | env | default | effect |
