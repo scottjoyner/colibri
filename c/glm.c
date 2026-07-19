@@ -1102,6 +1102,8 @@ static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE s
 static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
 static int expert_is_resident(Model *m, int layer, int eid); /* pin∪LRU; defined near pilot */
 static int64_t expert_bytes_probe(Model *m, int ebits);    /* per-expert weight+scale bytes */
+static int fc_read(shards *S, int fd, void *buf, int64_t n, int64_t off, const char *tag); /* RAM-mmap or pread fallback */
+static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag); /* positional full pread */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                            * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
@@ -1657,6 +1659,13 @@ static void *map_of_fd(int fd){
  * stampava "Success" quando pread ritorna un conteggio corto invece di -1
  * (errno resta 0 dalla syscall precedente) -> messaggio fuorviante nel path
  * score/bench (#236). Ritorna 0 = ok, -1 = errore reale o EOF. */
+/* COLI_FILECACHE read: if the shard is mmap'd+pinned in RAM (see st_init),
+ * copy straight from the locked mapping (zero disk, zero page faults). Otherwise
+ * fall back to the buffered positional pread. `fd` here is the shards fd-index. */
+static int fc_read(shards *S, int fd, void *buf, int64_t n, int64_t off, const char *tag){
+    if(S->map[fd]){ memcpy(buf, (char*)S->map[fd]+off, (size_t)n); return 0; }
+    return pread_full(fd, buf, n, off, tag);
+}
 static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag){
     char *p=buf; int64_t got=0;
     while(got<n){
@@ -1671,6 +1680,8 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
     return 0;
 }
 static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
+    double _el_t0=0,_el_io=0;
+    if(getenv("EXPLOAD_TIMING")){ _el_t0=now_s(); }
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */
@@ -1796,6 +1807,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
 #endif
     }
     int ord[3]={0,1,2};                          /* ordina per offset nel file */
+    if(getenv("EXPLOAD_TIMING")) _el_io -= now_s();
     for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
     int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
               && tw[ord[0]]->off+tw[ord[0]]->nbytes==tw[ord[1]]->off
@@ -1814,19 +1826,19 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
             }
         }
         if(!done){                               /* fallback bufferizzato */
-            if(pread_full(tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1); return -1; }
+            if(fc_read(&m->S, tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
         }
     }
     if(!done){                                   /* non contigui: 3 pread bufferizzate */
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread_full(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1); return -1; }
+            if(fc_read(&m->S, tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[k]=o; o+=tw[k]->nbytes; }
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
+        if(fc_read(&m->S, tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
                                                   * cache in pressione strangoli il throughput */
@@ -1842,6 +1854,22 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         if(gs>0) fmt=4;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+    }
+    if(getenv("EXPLOAD_TIMING")){
+        _el_io += now_s();
+        static long _el_n=0; static double _el_sum=0,_el_io_sum=0,_el_max=0;
+        static long _b[6]={0,0,0,0,0,0};
+        double tot=_el_t0>0?now_s()-_el_t0:0, io=_el_io>0?_el_io:0;
+        _el_n++; _el_sum += tot; _el_io_sum += io;
+        if(tot>_el_max) _el_max=tot;
+        long us=(long)(tot*1e6); if(us<1000)_b[0]++;else if(us<5000)_b[1]++;else if(us<20000)_b[2]++;else if(us<100000)_b[3]++;else if(us<300000)_b[4]++;else _b[5]++;
+        if(_el_n==4000){
+            fprintf(stderr,"[EXPLOAD] %ld calls: avg total %.1f us, avg I/O %.1f us (I/O frac %.0f%%), max %.1f us, wtot~%.1f MB\n",
+                    _el_n, _el_sum/_el_n*1e6, _el_io_sum/_el_n*1e6, 100.0*_el_io_sum/_el_sum,
+                    _el_max*1e6, (double)wtot/1048576.0);
+            fprintf(stderr,"[EXPLOAD] histogram (total us): <1k:%ld 1-5k:%ld 5-20k:%ld 20-100k:%ld 100-300k:%ld >300k:%ld\n",
+                    _b[0],_b[1],_b[2],_b[3],_b[4],_b[5]);
+        }
     }
     s->eid=eid; return 0;
 }

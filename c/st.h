@@ -38,10 +38,12 @@ typedef struct {
     int        fds[512];
     int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
     char      *paths[512];
+    void      *map[512];    /* COLI_FILECACHE: mmap base per shard (locked in RAM) */
+    int64_t    maplen[512];
     int        nfd;
     int       *hidx;      /* hash map nome->indice (open addressing): con ~120k tensori
-                           * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
-                           * costava decine di secondi/token (misurato sul primo run reale) */
+                            * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
+                            * costava decine di secondi/token (misurato sul primo run reale) */
     int        hcap;
 } shards;
 #define ST_MAX_SHARDS 512
@@ -184,6 +186,45 @@ static void st_init(shards *S, const char *snap_dir) {
         uint64_t h = st_hash(S->t[i].name) & (S->hcap - 1);
         while (S->hidx[h] >= 0) h = (h + 1) & (S->hcap - 1);
         S->hidx[h] = i;
+    }
+    /* COLI_FILECACHE: mmap + mlock every shard file ONCE at load so expert_load
+     * reads from locked RAM instead of faulting/streaming from NVMe on every
+     * miss. The model is only ~2.7 GB; pinning it fits comfortably at the
+     * RAM budgets we target and removes the cold-read tax that otherwise
+     * dominates decode (see glm52-xwing-expert-io note). */
+    if (getenv("COLI_FILECACHE")) {
+        /* Pin as many shards as the mlock budget (ulimit -l) allows. Largest
+         * first, so a few big shards claim the budget before it fragments on
+         * small ones — and we stop the moment mlock starts failing (budget
+         * exhausted) instead of burning it on tiny shards. Without mlock the
+         * mmap is just page cache and gets evicted under pressure exactly
+         * like a pread, so on failure we munmap and fall back to buffered
+         * pread (the correct, fast path). COLI_FILECACHE only helps when
+         * the pages can actually be pinned (ulimit -l unlimited / root). */
+        int *ord = malloc((size_t)S->nfd * sizeof(int));
+        for (int i = 0; i < S->nfd; i++) ord[i] = i;
+        for (int a = 0; a < S->nfd; a++)
+            for (int b = a+1; b < S->nfd; b++) {
+                struct stat sa, sb;
+                if (fstat(S->fds[ord[a]], &sa) || fstat(S->fds[ord[b]], &sb)) continue;
+                if (sa.st_size < sb.st_size) { int t = ord[a]; ord[a] = ord[b]; ord[b] = t; }
+            }
+        int npin = 0;
+        for (int ii = 0; ii < S->nfd; ii++) {
+            int fi = ord[ii]; int fd = S->fds[fi];
+            struct stat sst; if (fstat(fd, &sst) != 0) continue;
+            void *m = mmap(NULL, (size_t)sst.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m == MAP_FAILED) { perror("mmap shard"); continue; }
+            if (mlock(m, (size_t)sst.st_size)) { munmap(m, (size_t)sst.st_size); break; }
+            volatile unsigned char acc = 0;
+            for (int64_t p = 0; p < (int64_t)sst.st_size; p += 4096) acc += ((unsigned char*)m)[p];
+            (void)acc;
+            S->map[fd] = m; S->maplen[fd] = (int64_t)sst.st_size;
+            npin++;
+        }
+        free(ord);
+        if (npin) fprintf(stderr, "[FILECACHE] pinned %d/%d shard(s) into RAM\n", npin, S->nfd);
+        else fprintf(stderr, "[FILECACHE] 0/%d shards pinned (mlock denied: run with ulimit -l unlimited) — using buffered pread\n", S->nfd);
     }
 }
 
