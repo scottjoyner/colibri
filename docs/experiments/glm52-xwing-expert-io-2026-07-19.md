@@ -214,3 +214,34 @@ change here applies, and the optimum flips:
 - Numbers are single-run per config, greedy, warm cache; run-to-run variance not
   bounded (see METAL-M5MAX-PERF-REPORT.md determinism caveat — the same
   parallel-reduction non-determinism applies here under PIPE/OMP).
+
+## Concurrent generation (serve-mux, KV_SLOTS) — does NOT raise aggregate tok/s
+- **Question:** the engine already multiplexes up to `KV_SLOTS` (1–16) contexts in
+  one process via `run_serve_mux` (`c/glm.c:5021`) + `step_decode_batch`; the
+  OpenAI server's Python `GenerationScheduler(capacity=1)` is what serializes.
+  Would running 2–3 generations *concurrently* raise **aggregate** tokens/s on xwing?
+- **Protocol:** `SUBMIT <id> <slot> <bytes> <max_tokens> <temp> <top_p>\n<payload>\n`,
+  payload byte-count must EXCLUDE the trailing `\n` delimiter. Feed all N submits
+  up front (file-redirect, not a pipe — a pipe triggers `BAD_FRAME` framing loss on
+  this engine build); engine time-shares the slots and emits `DATA <id> <tok>` then
+  `DONE <id> STAT <emitted> <tok/s> <rss_gb> <hits%> <max_limited>`.
+  NOTE: mux mode forces `g_draft=0` (no MTP/speculative decode — not ragged-safe),
+  so per-stream speed is the non-MTP ~0.15–0.42 tok/s, not the 0.35 MTP peak.
+- **Measured (RAM_GB=24, COLI_CUDA_ATTN=1, NGEN=16, greedy):**
+  | N | total tok | wall (s) | aggregate tok/s | per-req tok/s |
+  |---|---|---|---|---|
+  | 1 | 16 | 46.8 | **0.34** | 0.42 |
+  | 2 | 32 | 100.4 | **0.31** | 0.18–0.24 |
+  | 3 | 48 | 129.2 | **0.37** | 0.14–0.16 |
+- **Verdict: NO aggregate gain.** Aggregate stays flat at ~0.3–0.37 tok/s for any N;
+  each request simply runs ~1/N as fast. This is the direct, expected consequence of
+  the 23× memory-bandwidth contention finding: one decode *step* costs the same
+  regardless of N, and `step_decode_batch` does N independent forwards per step — all
+  serialized on the same unified-memory bus competing with expert I/O. Multiplexing
+  buys **fairness/isolation between users**, not more tokens/s.
+- **Implication:** the only lever that raised xwing aggregate throughput remains the
+  `COLI_FILECACHE` mmap+mlock path — and that needs `ulimit -l unlimited` + root,
+  i.e. the 96 GB HX370, not this 24 GB-capped APU. On xwing, serving N concurrent
+  users = N× the latency, same total throughput. Don't prioritize serving-scale
+  work for xwing; prioritize single-stream expert-I/O bandwidth (page-cache hit
+  rate, `PC_GB`, residency) instead.
