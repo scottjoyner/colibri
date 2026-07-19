@@ -1101,12 +1101,22 @@ static float g_route_p=0;    /* ROUTE_P: if >0, choose M from cumulative router 
 static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE substitutes before renorm (1=off) */
 static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
 static int expert_is_resident(Model *m, int layer, int eid); /* pin∪LRU; defined near pilot */
+static int64_t expert_bytes_probe(Model *m, int ebits);    /* per-expert weight+scale bytes */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
-                          * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
-                          * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
-                          * rifiutato paga comunque i suoi expert dal disco = ~3x piu' lento.
-                          * Opt-in (DRAFT=4) per testi ripetitivi dove l'acceptance e' alta. */
+                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
+                           * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
+                           * rifiutato paga comunque i suoi expert dal disco = ~3x piu' lento.
+                           * Opt-in (DRAFT=4) per testi ripetitivi dove l'acceptance e' alta. */
+/* MTP auto-kill (#exp): when expert-disk wait dominates the decode wall-time, MTP's
+ * extra draft forwards (each loading a full topk of experts for rejected positions)
+ * are pure loss. Once we observe the wait fraction cross the threshold over a stable
+ * window, we permanently disable MTP drafting for the rest of the run. Gated by
+ * MTP_AUTO=0 to opt out; the explicit MTP=0 env still wins at startup. */
+static int g_mtp_auto=1;
+static int g_mtp_kill=0;            /* latched once wait-bound; forces has_mtp off in spec_decode */
+static double g_mtp_wtot=0;         /* cumulative decode expert-wait (s) */
+static double g_mtp_ttot=0;         /* cumulative decode wall-time (s) since last re-arm */
 /* metodo F (#48): GRAMMAR=<file.gbnf> -> terza sorgente di draft, la grammatica stessa.
  * Nei workload a output vincolato (JSON/NDJSON, function calling) i byte FORZATI dalla
  * grammatica (chiavi, punteggiatura, valori enum) sono draft gratuiti ad acceptance ~1:
@@ -1565,6 +1575,21 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
         rb+=qt_bytes(&m->ix_wq[i])+qt_bytes(&m->ix_wk[i])+qt_bytes(&m->ix_wp[i]);
     m->resident_bytes=rb;
+    /* Pre-allocate the shared ws[] dispatch slabs ONCE at model load. Every
+     * expert has identical weight/scale byte counts (same dims), so this size
+     * never changes across loads: allocating here removes the first-dispatch
+     * posix_memalign path and guarantees the slabs persist for the whole run
+     * (the LRU swap only moves the pointers, never frees them). */
+    {
+        int64_t eb=expert_bytes_probe(m,ebits); int64_t fb=(eb/3)/4 + 8192;  /* scales ~1/4 of weights */
+        int64_t need=((size_t)eb+8192+16383)&~(size_t)16383;
+        for(int q=0;q<64;q++){
+            if(posix_memalign((void**)&m->ws[q].slab,16384,need)){ fprintf(stderr,"OOM ws slab\n"); exit(1); }
+            m->ws[q].slab_cap=need;
+            if(posix_memalign((void**)&m->ws[q].fslab,16384,(size_t)fb*sizeof(float))){ fprintf(stderr,"OOM ws fslab\n"); exit(1); }
+            m->ws[q].fslab_cap=(int64_t)fb;
+        }
+    }
 }
 
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
@@ -4213,7 +4238,26 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
+    /* MTP auto-kill (#exp): sample per-forward expert-wait vs wall-time. When the
+     * wait dominates decode, MTP's extra draft forwards are pure disk loss, so we
+     * latch has_mtp=0 for the rest of the run. */
+    double ew0 = m->t_ewait;
+    double tw0 = now_s();
     while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
+        if(g_mtp_auto && !g_mtp_kill && m->has_mtp){
+            double de = m->t_ewait - ew0; ew0 = m->t_ewait;
+            double dt = now_s() - tw0;  tw0 = now_s();
+            g_mtp_wtot += de; g_mtp_ttot += dt;
+            if(g_mtp_ttot > 3.0){                      /* re-arm window of ~3s decode */
+                if(g_mtp_ttot > 0 && g_mtp_wtot/g_mtp_ttot > 0.5){
+                    g_mtp_kill=1; m->has_mtp=0;
+                    fprintf(stderr,"[MTP_AUTO] expert-disk wait %.0f%% of decode (%.2fs/%.2fs): "
+                            "disabling MTP drafting for the rest of the run (MTP_AUTO=0 to keep)\n",
+                            100.0*g_mtp_wtot/g_mtp_ttot, g_mtp_wtot, g_mtp_ttot);
+                }
+                g_mtp_wtot=0; g_mtp_ttot=0;
+            }
+        }
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
@@ -5726,7 +5770,13 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * on a 32 GB machine, causing memory pressure that DROPPED the hit rate (73%->57%)
      * and slowed decode (1.03->0.83 tok/s). The reserve is a legitimate safety margin
      * for OS + CUDA + file metadata, not just buffered pread throughput. Keep it. */
-    double pc_b  = 2.5e9;
+    /* PC_GB env lets the user trade page-cache reserve for expert LRU residency
+     * (issue #exp): at small RAM_GB the default 2.5 GB reserve forces cap=1, so
+     * every token reloads all experts. Lowering it (the model file is only ~2.7 GB
+     * and stays in the OS cache) raises the expert cap and cuts disk wait. The
+     * 2.5 GB floor remains the default — this only loosens it when the user asks. */
+    double pc_b  = getenv("PC_GB")? (atof(getenv("PC_GB"))*1e9) : 2.5e9;
+    if(pc_b<0.5e9) pc_b=0.5e9;
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
@@ -5911,6 +5961,7 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
+    g_mtp_auto = getenv("MTP_AUTO")?atoi(getenv("MTP_AUTO")):1;
     g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 se MTP, 0 senza */
     g_looka = getenv("LOOKA")?atoi(getenv("LOOKA")):0;    /* 1 = misura predicibilita' routing */
     g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = prefetch pilotato dal router */
