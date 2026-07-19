@@ -33,9 +33,15 @@ unset COLI_GPUS 2>/dev/null || true
 
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 RESULTS=${RESULTS:-bench_hx370_results.tsv}
-[ -f "$RESULTS" ] || printf 'run_id\tram_gb\ttopp\tn\tcores\tdecode_tok_s\thit_rate\tdisk_wait_s\tdecode_s\trss_gb\n' > "$RESULTS"
+[ -f "$RESULTS" ] || printf 'run_id\tiomode\tram_gb\ttopp\tn\tcores\tdecode_tok_s\thit_rate\tdisk_wait_s\tdecode_s\trss_gb\n' > "$RESULTS"
 
-echo "=== bench $RUN_ID | ram=$RAM_GB topp=$TOPP n=$N cores=$OMP_NUM_THREADS ==="
+# capture active I/O lever(s) so URING/PIPE sweeps are distinguishable
+IOMODE="base"
+[ "${URING:-0}" = "1" ] && IOMODE="uring"
+[ "${PIPE:-0}" = "1" ] && IOMODE="${IOMODE:+$IOMODE+}pipe"
+[ "$IOMODE" = "base" ] && IOMODE="base$([ "${DIRECT:-0}" = "1" ] && echo +direct)"
+
+echo "=== bench $RUN_ID | iomode=$IOMODE ram=$RAM_GB topp=$TOPP n=$N cores=$OMP_NUM_THREADS ==="
 echo "    prompt: ${PROMPT:0:48}..."
 
 # SNAP=<model> ./glm <ctx> <batch> <ngen>  -> here batch=1 (decode), ctx small
@@ -68,8 +74,8 @@ DISK_WAIT=$(echo "$OUT" | grep -E 'PROFILE: expert-disk' | tail -1 | grep -oE 'e
 
 DECODE=${DECODE:-NA}; HIT=${HIT:-NA}; DISK_WAIT=${DISK_WAIT:-NA}; DECODE_S=${DECODE_S:-NA}; RSS=${RSS:-NA}
 
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-  "$RUN_ID" "$RAM_GB" "$TOPP" "$N" "$OMP_NUM_THREADS" "$DECODE" "$HIT" "$DISK_WAIT" "$DECODE_S" "$RSS" >> "$RESULTS"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$RUN_ID" "$IOMODE" "$RAM_GB" "$TOPP" "$N" "$OMP_NUM_THREADS" "$DECODE" "$HIT" "$DISK_WAIT" "$DECODE_S" "$RSS" >> "$RESULTS"
 
 echo "    -> decode=${DECODE} tok/s  hit=${HIT}%  disk_wait=${DISK_WAIT}s  decode_s=${DECODE_S}s  rss=${RSS}GB"
 echo "    saved to $RESULTS"
