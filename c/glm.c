@@ -1550,6 +1550,13 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
         if(!l->sparse) rb+=qt_bytes(&l->gate_proj)+qt_bytes(&l->up_proj)+qt_bytes(&l->down_proj);
         else rb+=qt_bytes(&l->sh_gate)+qt_bytes(&l->sh_up)+qt_bytes(&l->sh_down);
+#ifdef COLI_CUDA
+        /* Vulkan attention offload (COLI_CUDA_ATTN) uploads kv_b/o lazily via
+         * qt_cuda_upload() at dispatch time; we deliberately do NOT set
+         * cuda_eligible here, so the CPU host mmap stays wired (fast CPU path)
+         * and the weights are only copied to VRAM when a GPU dispatch actually
+         * runs (S>=COLI_CUDA_ATTN_MIN_S). */
+#endif
     }
     if(m->has_mtp){ Layer *l=&m->mtpL;
         rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
@@ -2498,6 +2505,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512;
 #endif
     int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4) || cuda_absorb;
+    int attn_min_s = getenv("COLI_CUDA_ATTN_MIN_S") ? atoi(getenv("COLI_CUDA_ATTN_MIN_S")) : 32;
+    if(cuda_absorb && S < attn_min_s) cuda_absorb = 0;   /* GPU only helps at large S */
     if(absorb && c->kv_lora<=512){
         m->t_aproj+=now_s()-ta0; double tac=now_s();
         int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
@@ -2534,14 +2543,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 cs+(int64_t)l->shard_h0[d]*S*vh+(int64_t)s*l->shard_hn[d]*vh,
                 (size_t)l->shard_hn[d]*vh*sizeof(float));
             free(qs);free(cs);cuda_core=ok;
-        } else if(cuda_absorb&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
+        } else if(cuda_absorb&&S>4&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
             int st0=m->kv_start[layer],nt=pos_base+S-st0;
             cuda_core=cuda_projected=coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
                 coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
                 S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
         } else if(S<=4&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
-           l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){
+           qt_cuda_upload(&l->kv_b)){
             cuda_core=1;
             for(int s=0;s<S&&cuda_core;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;int pos=positions?positions[s]:pos_base+s;
@@ -2553,7 +2562,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         Q+(int64_t)s*H*qh,m->kv_dev_L[layer]+(size_t)st0*kvl,
                         m->kv_dev_R[layer]+(size_t)st0*c->qk_rope,H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
-                if(!cuda_core)
+                if(!cuda_core && S>=attn_min_s)
                     cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
                         Q+(int64_t)s*H*qh,coli_kv_row(ks->Lc[layer],st0,kvl),
                         coli_kv_row(ks->Rc[layer],st0,c->qk_rope),H,c->qk_nope,c->qk_rope,
@@ -2590,6 +2599,38 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
+        }
+        if(getenv("COLI_ATTN_CMP")){
+            /* numerical comparison: path-2 (kvb reconstruction) vs path-1 (absorb) */
+            int kvb_dim=H*(c->qk_nope+vh);
+            float*kvb=falloc((size_t)Tk*kvb_dim);
+            int stL=m->kv_start[layer];
+            matmul_qt(kvb+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+            float*p2c=falloc((size_t)S*H*vh);
+            #pragma omp parallel for collapse(2) schedule(static)
+            for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+                int pos=pos_base+s; const float*qp=Q+(int64_t)s*H*qh+(int64_t)h*qh; const float*qr=qp+c->qk_nope;
+                int rbase=h*(c->qk_nope+vh); int st0=m->kv_start[layer]; int nt=pos+1-st0;
+                float*sc=falloc(nt);
+                for(int jj=0;jj<nt;jj++){ int t=st0+jj; const float*kn=kvb+(int64_t)t*kvb_dim+rbase; const float*kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
+                    float a=0; for(int d=0;d<c->qk_nope;d++)a+=qp[d]*kn[d]; for(int d=0;d<c->qk_rope;d++)a+=qr[d]*kr[d]; sc[jj]=a*c->attn_scale; }
+                softmax(sc,nt);
+                float*cx=p2c+((int64_t)s*H+h)*vh; for(int d=0;d<vh;d++)cx[d]=0;
+                for(int jj=0;jj<nt;jj++){ int t=st0+jj; const float*vv=kvb+(int64_t)t*kvb_dim+rbase+c->qk_nope; float a=sc[jj]; for(int d=0;d<vh;d++)cx[d]+=a*vv[d]; }
+                free(sc);
+            }
+            if(cuda_projected){
+                /* GPU wrote final o_proj to out; compute CPU reference out and diff */
+                float*refout=falloc((size_t)S*D);
+                matmul_qt(refout, p2c, &l->o, S);
+                float md=0; for(int i=0;i<S*D;i++){float d=fabsf(refout[i]-out[i]); if(d>md)md=d;}
+                fprintf(stderr,"[ATTN-CMP] layer%d GPU-out vs CPU-ref maxdiff=%.6f\n",layer,md);
+                free(refout);
+            } else {
+                float md=0; for(int i=0;i<S*H*vh;i++){float d=fabsf(p2c[i]-ctx[i]); if(d>md)md=d;}
+                fprintf(stderr,"[ATTN-CMP] layer0 path1-vs-path2 ctx_maxdiff=%.6f\n",md);
+            }
+            free(kvb); free(p2c);
         }
         m->t_acore+=now_s()-tac; double tao=now_s();
         if(!cuda_projected){matmul_qt(out, ctx, &l->o, S);} m->t_aout+=now_s()-tao;
@@ -3843,6 +3884,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
     m->t_head += now_s()-th0;
+    if(getenv("DBG_STEP")){
+        int top[5]={0,0,0,0,0}; float tv[5]={-1e30,-1e30,-1e30,-1e30,-1e30};
+        for(int i=0;i<c->vocab;i++){ for(int k=0;k<5;k++) if(logit[i]>tv[k]){ for(int j=4;j>k;j--){top[j]=top[j-1];tv[j]=tv[j-1];} top[k]=i; tv[k]=logit[i]; break; } }
+        fprintf(stderr,"[DBG-STEP] S=%d top5:",S);
+        for(int k=0;k<5;k++) fprintf(stderr," %d=%.3f",top[k],tv[k]);
+        fprintf(stderr,"\n");
+    }
     free(x); free(last); return logit;
 }
 
@@ -4325,6 +4373,15 @@ static void run_score(Model *m, const char *snap, const char *path){
         }
         for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
         layers_forward(m,x,T,0);
+        if(getenv("DBG_STEP")){
+            int pos=ctxlen-1; float *row=falloc(D); rmsnorm(row,x+(int64_t)pos*D,m->final_norm,D,c->eps);
+            float *lo=falloc(c->vocab); matmul_qt(lo,row,&m->lm_head,1);
+            int top[5]={0,0,0,0,0}; float tv[5]={-1e30,-1e30,-1e30,-1e30,-1e30};
+            for(int i=0;i<c->vocab;i++){ for(int k=0;k<5;k++) if(lo[i]>tv[k]){ for(int j=4;j>k;j--){top[j]=top[j-1];tv[j]=tv[j-1];} top[k]=i; tv[k]=lo[i]; break; } }
+            fprintf(stderr,"[DBG-SCORE] pos=%d T=%d ctxlen=%d top5:",pos,T,ctxlen);
+            for(int k=0;k<5;k++) fprintf(stderr," %d=%.3f",top[k],tv[k]);
+            fprintf(stderr,"\n"); free(row); free(lo);
+        }
         double lp=0; int greedy=1;
         for(int pos=ctxlen-1; pos<T-1; pos++){
             rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
@@ -4406,6 +4463,28 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }
+    /* prefisso GLM (#108): come SCORE, antepone [gMASK]<sop> se lo snapshot e' glm*
+     * e il prompt non e' gia' prefissato. DISABLE con SCORE_PREFIX=0. */
+    int pfx[2]={-1,-1}, pfx_on=0;
+    if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
+        char *ar=NULL; jval *r=cfg_root(snap,&ar);
+        jval *mt=json_get(r,"model_type");
+        if(mt_is_glm(mt?mt->str:NULL)){
+            pfx[0]=tok_id_of(&T,"[gMASK]"); pfx[1]=tok_id_of(&T,"<sop>");
+            if(pfx[0]>=0&&pfx[1]>=0) pfx_on=1;
+        }
+        free(ar);
+    }
+    if(pfx_on){
+        if(!(np>=2 && pids[0]==pfx[0] && pids[1]==pfx[1])){
+            int ncap=cap+2; int *pp=realloc(pids,(size_t)ncap*sizeof(int));
+            if(!pp){ fprintf(stderr,"OOM prefix\n"); return; }
+            pids=pp; memmove(pids+2,pids,(size_t)np*sizeof(int));
+            pids[0]=pfx[0]; pids[1]=pfx[1]; np+=2;
+            fprintf(stderr,"[run_text] GLM: prepended [gMASK]<sop> (ids %d,%d); disable with SCORE_PREFIX=0\n",pfx[0],pfx[1]);
+        }
+    }
+    { fprintf(stderr,"[DBG-PIDS]"); for(int i=0;i<np;i++) fprintf(stderr," %d",pids[i]); fprintf(stderr,"\n"); }
     printf("prompt: %d tokens | generating up to %d (EOS stop=%d) | n-gram draft=%d\n", np, ngen, eos, g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
@@ -5539,6 +5618,20 @@ static void pin_load(Model *m, const char *statspath, double gb){
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
+        /* On a split-pool GPU (dedicated VRAM separate from system RAM, e.g.
+         * Strix Halo's fixed VRAM carve) the uploaded expert weights live in
+         * VRAM, NOT system RAM — and with g_cuda_release_host their host backing
+         * is freed. Counting them against the system-RAM cap (as the CUDA
+         * unified-memory path does) starves the RAM expert cache. Subtract the
+         * VRAM-resident bytes so the RAM budget reflects only RAM-resident
+         * experts. Harmless on true unified memory too. */
+        if(g_cuda_release_host && m->gpu_expert_bytes>0)
+            m->resident_bytes-=(int64_t)m->gpu_expert_bytes;
+        else if(m->gpu_expert_bytes>0) {
+            /* No host release: VRAM experts keep RAM backing too. Counting them
+             * twice (VRAM + RAM) over-states residency but is the safe/conservative
+             * choice — keep the cap honest so we don't OOM. No subtraction. */
+        }
     }
 #endif
     if(gpu_prefix>0&&gpu_prefix<npin){

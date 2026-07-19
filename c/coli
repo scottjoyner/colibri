@@ -144,8 +144,11 @@ def cuda_binary():
     if not os.path.exists(GLM) or sys.platform != "linux": return False
     try:
         linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
-        return any("libcudart" in line and "not found" not in line
-                   for line in linked.stdout.splitlines())
+        txt=linked.stdout
+        # Vulkan builds link libvulkan (not libcudart) but expose the same
+        # coli_cuda_* ABI, so treat a vulkan-linked engine as GPU-capable too.
+        return any(("libcudart" in line or "libvulkan" in line) and "not found" not in line
+                   for line in txt.splitlines())
     except (OSError,subprocess.SubprocessError): return False
 
 def resource_request(a, env):

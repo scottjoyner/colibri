@@ -31,7 +31,10 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
+
+static double now_s(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec*1e-9; }
 
 /* ---- opaque tensor (engine stores the pointer, never dereferences) ---- */
 struct ColiCudaTensor {
@@ -76,7 +79,7 @@ static const char* S_MATMUL =
 "  float acc=0.0f;\n"
 "  uint rb=uint((I_DIM+1)/2);\n"
 "  for(uint i=0u;i<uint(I_DIM);i++){\n"
-"    uint byte=w[o*rb + (i>>1u)];\n"
+"    uint bo=o*rb + (i>>1u); uint byte=(w[bo>>2u] >> ((bo&3u)*8u)) & 0xFFu;\n"
 "    int nib = (i&1u)!=0u ? int(byte>>4u) : int(byte&0xFu);\n"
 "    int wq = nib-8;\n"
 "    acc += x[S*uint(I_DIM) + i] * float(wq);\n"
@@ -145,6 +148,25 @@ static VkBuffer make_buf(size_t bytes, VkDeviceMemory* mem){
     vkBindBufferMemory(g_dev,buf,*mem,0);
     return buf;
 }
+
+/* Persistent scratch buffers for attention: allocated once, grown only when a
+ * larger shape is needed, and kept mapped. Avoids the per-call vkCreateBuffer /
+ * vkAllocateMemory / map / vkDestroyBuffer storm that forced a queue flush and
+ * turned every attention layer into a ~130ms submit+wait round-trip. On this APU
+ * the memory is unified, so host-visible scratch is the fast path. */
+typedef struct { VkBuffer buf; VkDeviceMemory mem; size_t cap; void* map; } PersistBuf;
+static PersistBuf g_pb[6]={0};   /* 0=q 1=l 2=r 3=c 4=o 5=kvbb */
+static VkBuffer pb_get(int i, size_t bytes, VkDeviceMemory* mem, void** map){
+    PersistBuf* p=&g_pb[i];
+    if(!p->buf || bytes>p->cap){
+        if(p->buf){ vkDestroyBuffer(g_dev,p->buf,NULL); vkFreeMemory(g_dev,p->mem,NULL); p->map=NULL; }
+        p->buf=make_buf(bytes,&p->mem); if(!p->buf) return NULL;
+        p->cap=bytes;
+        if(vkMapMemory(g_dev,p->mem,0,bytes,0,&p->map)!=VK_SUCCESS){ p->map=NULL; return NULL; }
+    }
+    *mem=p->mem; *map=p->map; return p->buf;
+}
+static void pb_reset(void){ for(int i=0;i<6;i++){ if(g_pb[i].buf){ vkDestroyBuffer(g_dev,g_pb[i].buf,NULL); vkFreeMemory(g_dev,g_pb[i].mem,NULL);} g_pb[i].buf=NULL; g_pb[i].mem=NULL; g_pb[i].cap=0; g_pb[i].map=NULL; } }
 static VkShaderModule g_mod_matmul=NULL, g_mod_silu=NULL;
 
 /* ---- shader module cache (avoid recompiling glslang per call) ---- */
@@ -312,7 +334,7 @@ int coli_cuda_init(const int *devices, int count){
     float qp_=1.0f; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=g_qf,.queueCount=1,.pQueuePriorities=&qp_};
     if(vkCreateDevice(g_pd,&(VkDeviceCreateInfo){.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci},NULL,&g_dev)!=VK_SUCCESS){ fprintf(stderr,"[VK] device\n"); return 0; }
     vkGetDeviceQueue(g_dev,g_qf,0,&g_queue);
-    vkCreateCommandPool(g_dev,&(VkCommandPoolCreateInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=g_qf},NULL,&g_pool);
+    vkCreateCommandPool(g_dev,&(VkCommandPoolCreateInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,.queueFamilyIndex=g_qf},NULL,&g_pool);
     vkCreateFence(g_dev,&(VkFenceCreateInfo){.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO},NULL,&g_fence);
     /* shaders are compiled lazily + cached per shape (get_matmul_module/get_silu_module) */
     g_enabled=1; free(pds);
@@ -502,7 +524,191 @@ int coli_cuda_tensor_update(ColiCudaTensor *tensor, const void *weights, const f
     return 1;
 }
 
-/* ---- pipe_* / attention: not implemented -> engine falls back to CPU ---- */
+/* ---- MLA attention weight-absorption (decode/prefill) on Vulkan ----
+ * Faithful port of backend_cuda.cu's attention_absorb(_batch/_project_batch).
+ * kv_b is [H*(Q+V), K] int4; rows h*(Q+V)+d (d<Q) are the q-navigation weights,
+ * rows h*(Q+V)+Q+v (v<V) are the value weights. q is [S,H,Q+R]; latent [T,K];
+ * rope [T,R]. score(t)= qa·latent[t] + q_rope·rope[t]; softmax over t (causal
+ * nt=T-S+s+1); ctx[h*V+v]= Σ_t score(t) * (latent[t]·Wvalue[h,v]). o_proj
+ * [D,H*V] maps ctx -> out.
+ *
+ * Push-constant layout (shared by both shaders), 48 bytes:
+ *   S H Q R V K T  O  I  pad  scale
+ *   i i i i i i i  i  i  i   f
+ * O = out dim (D) for o_proj, unused in absorb. I = weight row len in bytes'
+ * (K+1)/2 for absorb, (H*V+1)/2 for o_proj. */
+/* S_ATTN_R: PATH-2 reconstruction. Builds kvb[t, r] = sum_d Lc[t,d] * wgt(r,d) * sc[r]
+ * for every position t (0..T-1) and every kv_b row r (0..H*(Q+V)-1). This is exactly
+ * matmul_qt(Lc, kv_b) (the k_nope || v reconstruction the default CPU path does), so the
+ * GPU now follows the same formulation as the CPU reference. Output: kvb[T][H*(Q+V)]. */
+static const char* S_ATTN_R =
+"#version 450\n"
+"layout(local_size_x=64) in;\n"
+"layout(std430,binding=0) readonly buffer Wbuf { uint w[]; };\n"
+"layout(std430,binding=1) readonly buffer Sbuf { float sc[]; };\n"
+"layout(std430,binding=2) readonly buffer Lbuf { float lat[]; };\n"
+"layout(std430,binding=3) writeonly buffer KVbuf { float kvb[]; };\n"
+"layout(push_constant) uniform PC { int S; int H; int Q; int R; int V; int K; int T; int O; int I; int pad; float scale; } pc;\n"
+"int wgt(uint row,uint k){ uint rb=uint(pc.I); uint bo=row*rb+(k>>1u); uint byte=(w[bo>>2u] >> ((bo&3u)*8u)) & 0xFFu; int nib=(k&1u)!=0?int(byte>>4u):int(byte&0xFu); return nib-8; }\n"
+"void main(){\n"
+"  uint r=gl_GlobalInvocationID.x;        // kv_b row (head*((Q+V)) + local)\n"
+"  uint t=gl_GlobalInvocationID.y;        // KV position\n"
+"  int kvb_dim=pc.H*(pc.Q+pc.V);\n"
+"  if(r>=uint(kvb_dim) || t>=uint(pc.T)) return;\n"
+"  float a=0.0f;\n"
+"  for(int d=0;d<pc.K;d++){ a += lat[(uint(t)*uint(pc.K))+uint(d)] * float(wgt(r,uint(d))) * sc[r]; }\n"
+"  kvb[(uint(t)*uint(kvb_dim))+r]=a;\n"
+"}\n";
+
+/* S_ATTN_S: PATH-2 attention. One thread per (s,h,v): online-softmax over t.
+ *   score = q[k_nope].kvb[t,h*(Q+V)+0..Q-1] + q_rope.rope[t], then
+ *   ctx[s,h,v] = sum_t w[t]*kvb[t, h*(Q+V)+Q+v],  w=softmax(score*scale).
+ * Parallel over V (H*S*V threads) for full occupancy; no per-thread stack
+ * arrays. Reads kvb from S_ATTN_R. Causal: s attends t in [0, T-S+s]. */
+static const char* S_ATTN_S =
+"#version 450\n"
+"layout(local_size_x=64) in;\n"
+"layout(std430,binding=0) readonly buffer KVbuf { float kvb[]; };\n"
+"layout(std430,binding=1) readonly buffer Qbuf { float q[]; };\n"
+"layout(std430,binding=2) readonly buffer Rbuf { float rope[]; };\n"
+"layout(std430,binding=3) writeonly buffer Cbuf { float ctx[]; };\n"
+"layout(push_constant) uniform PC { int S; int H; int Q; int R; int V; int K; int T; int O; int I; int pad; float scale; } pc;\n"
+"void main(){\n"
+"  uint idx=gl_GlobalInvocationID.x;\n"
+"  uint s=gl_GlobalInvocationID.y;\n"
+"  if(s>=uint(pc.S)) return;\n"
+"  uint h=idx/uint(pc.V); uint v=idx%uint(pc.V);\n"
+"  if(h>=uint(pc.H)) return;\n"
+"  int kvb_dim=pc.H*(pc.Q+pc.V);\n"
+"  int rbase=int(h)*(pc.Q+pc.V);\n"
+"  int nt=pc.T-pc.S+int(s)+1;\n"
+"  if(nt<1) return;\n"
+"  int qoff=(int(s)*pc.H+int(h))*(pc.Q+pc.R);\n"
+"  /* pass 1: max score */\n"
+"  float mx=-1e30f;\n"
+"  for(int t=0;t<nt;t++){\n"
+"    float a=0.0f;\n"
+"    for(int k=0;k<pc.Q;k++){ a += q[qoff+k]*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+k)]; }\n"
+"    for(int d=0;d<pc.R;d++){ a += q[qoff+pc.Q+d]*rope[(uint(t)*uint(pc.R))+uint(d)]; }\n"
+"    float sc=a*pc.scale; if(sc>mx) mx=sc; }\n"
+"  /* pass 2: weighted sum of v */\n"
+"  float sum=0.0f, acc=0.0f;\n"
+"  for(int t=0;t<nt;t++){\n"
+"    float a=0.0f;\n"
+"    for(int k=0;k<pc.Q;k++){ a += q[qoff+k]*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+k)]; }\n"
+"    for(int d=0;d<pc.R;d++){ a += q[qoff+pc.Q+d]*rope[(uint(t)*uint(pc.R))+uint(d)]; }\n"
+"    float w=exp(a*pc.scale-mx); sum+=w;\n"
+"    acc += w*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+pc.Q+v)]; }\n"
+"  ctx[(uint(s)*uint(pc.H)+h)*uint(pc.V)+v]=acc/(sum>0.0f?sum:1.0f);\n"
+"}\n";
+
+static const char* S_ATTN_O =
+"#version 450\n"
+"layout(local_size_x=64) in;\n"
+"layout(std430,binding=0) readonly buffer Wbuf { uint w[]; };\n"
+"layout(std430,binding=1) readonly buffer Sbuf { float sc[]; };\n"
+"layout(std430,binding=2) readonly buffer Cbuf { float ctx[]; };\n"
+"layout(std430,binding=3) writeonly buffer Obuf { float outv[]; };\n"
+"layout(push_constant) uniform PC { int S; int H; int Q; int R; int V; int K; int T; int O; int I; int pad; float scale; } pc;\n"
+"int wgt(uint row,uint k){ uint rb=uint(pc.I); uint bo=row*rb+(k>>1u); uint byte=(w[bo>>2u] >> ((bo&3u)*8u)) & 0xFFu; int nib=(k&1u)!=0?int(byte>>4u):int(byte&0xFu); return nib-8; }\n"
+"void main(){\n"
+"  uint s=gl_GlobalInvocationID.y; uint d=gl_GlobalInvocationID.x;\n"
+"  if(s>=uint(pc.S) || d>=uint(pc.O)) return;\n"
+"  int HV=pc.H*pc.V; float acc=0.0f;\n"
+"  for(int hv=0;hv<HV;hv++) acc += ctx[(uint(s)*uint(HV))+uint(hv)]*float(wgt(uint(d),uint(hv)))*sc[uint(d)];\n"
+"  outv[uint(s)*uint(pc.O)+d]=acc;\n"
+"}\n";
+
+static VkShaderModule g_mod_attn_r=NULL, g_mod_attn_s=NULL, g_mod_attn_o=NULL;
+static int g_attn_failed=0;
+static int dbg_attn_init=0;
+
+/* cached pipeline/layout per module (created once, reused across calls) */
+typedef struct { VkShaderModule mod; VkPipeline ppl; VkPipelineLayout pl; VkDescriptorSetLayout dsl; } AttnPipe;
+static AttnPipe g_pipe[3]={0};
+
+/* Persistent dispatch resources: ONE command buffer + fence + per-role descriptor
+ * set, reused across every layer-call so we do a single submit+wait per call
+ * instead of one synced submit per dispatch. [0]=reconstruct(R), [1]=attend(S), [2]=o_proj(O). */
+static VkCommandBuffer g_attn_cb=NULL;
+static VkDescriptorPool g_attn_dp=NULL;
+static VkDescriptorSet g_attn_ds[3]={NULL,NULL,NULL};
+static int g_attn_rsrc_ok=0;
+static AttnPipe* get_attn_pipe(VkShaderModule mod);
+
+static int attn_ensure_resources(void){
+    if(!g_dev) return 0;
+    if(!g_attn_rsrc_ok){
+        VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool=g_pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+        if(vkAllocateCommandBuffers(g_dev,&cai,&g_attn_cb)!=VK_SUCCESS) return 0;
+        VkDescriptorPoolSize ps={VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,16};
+        VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets=3,.poolSizeCount=1,.pPoolSizes=&ps,.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT};
+        if(vkCreateDescriptorPool(g_dev,&dpci,NULL,&g_attn_dp)!=VK_SUCCESS) return 0;
+        g_attn_rsrc_ok=1;
+    }
+    /* Ensure each loaded module has its pipeline/layout created, then allocate the
+     * matching persistent descriptor set if it is not yet allocated. Modules load
+     * lazily (g_mod_attn_o only when an o_proj call happens), so this must run on
+     * every call to catch a newly-loaded module whose descriptor set is still NULL. */
+    if(g_mod_attn_r) get_attn_pipe(g_mod_attn_r);
+    if(g_mod_attn_s) get_attn_pipe(g_mod_attn_s);
+    if(g_mod_attn_o) get_attn_pipe(g_mod_attn_o);
+    for(int i=0;i<3;i++){
+        if(!g_attn_ds[i] && g_pipe[i].dsl){
+            VkDescriptorSetAllocateInfo dai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool=g_attn_dp,.descriptorSetCount=1,.pSetLayouts=&g_pipe[i].dsl};
+            if(vkAllocateDescriptorSets(g_dev,&dai,&g_attn_ds[i])!=VK_SUCCESS) return 0;
+        }
+    }
+    return 1;
+}
+
+static AttnPipe* get_attn_pipe(VkShaderModule mod){
+    for(int i=0;i<3;i++) if(g_pipe[i].mod==mod) return &g_pipe[i];
+    AttnPipe* p=NULL;
+    for(int i=0;i<3;i++) if(!g_pipe[i].mod){ p=&g_pipe[i]; break; }
+    if(!p) return NULL;
+    VkDescriptorSetLayoutBinding bnd[6]={
+        {0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0},
+        {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0}};
+    vkCreateDescriptorSetLayout(g_dev,&(VkDescriptorSetLayoutCreateInfo){.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=6,.pBindings=bnd},NULL,&p->dsl);
+    VkPushConstantRange pcr={.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,.offset=0,.size=48};
+    vkCreatePipelineLayout(g_dev,&(VkPipelineLayoutCreateInfo){.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&p->dsl,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr},NULL,&p->pl);
+    VkPipelineShaderStageCreateInfo ssi={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=mod,.pName="main"};
+    vkCreateComputePipelines(g_dev,0,1,&(VkComputePipelineCreateInfo){.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage=ssi,.layout=p->pl},NULL,&p->ppl);
+    p->mod=mod;
+    return p;
+}
+
+/* Record one dispatch into the persistent command buffer g_attn_cb.
+ * Updates the persistent descriptor set `ds` to point at b0..b5, binds it with
+ * the given push constants, and emits a vkCmdDispatch. No submit/wait here. */
+static int attn_record(VkShaderModule mod, VkDescriptorSet ds, int nbind,
+                       VkBuffer b0,VkBuffer b1,VkBuffer b2,VkBuffer b3,VkBuffer b4,VkBuffer b5,
+                       uint32_t x,uint32_t y, int S,int H,int Q,int R,int V,int K,int T,int O,int I,float scale){
+    AttnPipe* ap=get_attn_pipe(mod);
+    if(!ap||!ap->ppl||!ds) return 0;
+    VkBuffer bb[6]={b0,b1,b2,b3,b4,b5};
+    VkDescriptorBufferInfo bi[6]; VkWriteDescriptorSet wds[6];
+    for(int i=0;i<nbind;i++){ bi[i]=(VkDescriptorBufferInfo){bb[i],0,VK_WHOLE_SIZE};
+        wds[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=ds,.dstBinding=i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]}; }
+    vkUpdateDescriptorSets(g_dev,nbind,wds,0,NULL);
+    int pc[10]; float pcf; pc[0]=S;pc[1]=H;pc[2]=Q;pc[3]=R;pc[4]=V;pc[5]=K;pc[6]=T;pc[7]=O;pc[8]=I;pc[9]=0;pcf=scale;
+    uint8_t pcbuf[48]; memset(pcbuf,0,48); memcpy(pcbuf,pc,40); memcpy(pcbuf+40,&pcf,4);
+    vkCmdBindPipeline(g_attn_cb,VK_PIPELINE_BIND_POINT_COMPUTE,ap->ppl);
+    vkCmdBindDescriptorSets(g_attn_cb,VK_PIPELINE_BIND_POINT_COMPUTE,ap->pl,0,1,&ds,0,0);
+    vkCmdPushConstants(g_attn_cb,ap->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,48,pcbuf);
+    vkCmdDispatch(g_attn_cb,(x+63)/64,(y>0?y:1),1);
+    return 1;
+}
+
+/* ---- pipe_* / attention: implemented for attention, stubs for pipe_* ---- */
 float *coli_cuda_pipe_scratch(int d,int s,size_t b){(void)d;(void)s;(void)b;return NULL;}
 void *coli_cuda_pipe_alloc(int d,size_t b){(void)d;(void)b;return NULL;}
 void coli_cuda_pipe_free(int d,void*p){(void)d;(void)p;}
@@ -519,9 +725,234 @@ int coli_cuda_pipe_rope_base(int d,float*v,int pb,int r,int st,int off,int R,int
 int coli_cuda_pipe_copy2d(int d,float*dst,int dp,const float*src,int sp,int w,int h){(void)d;(void)dst;(void)dp;(void)src;(void)sp;(void)w;(void)h;return 0;}
 int coli_cuda_pipe_peer_copy(int dd,float*dst,int sd,const float*src,size_t b){(void)dd;(void)dst;(void)sd;(void)src;(void)b;return 0;}
 int coli_cuda_pipe_sync(int d){(void)d;return 0;}
-int coli_cuda_attention_absorb(ColiCudaTensor*kv,float*c,const float*q,const float*l,const float*r,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)c;(void)q;(void)l;(void)r;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
-int coli_cuda_attention_absorb_batch(ColiCudaTensor*kv,float*c,const float*q,const float*l,const float*r,int S,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)c;(void)q;(void)l;(void)r;(void)S;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
-int coli_cuda_attention_project_batch(ColiCudaTensor*kv,ColiCudaTensor*o,float*out,const float*q,const float*l,const float*r,int S,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)o;(void)out;(void)q;(void)l;(void)r;(void)S;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
+/* forward declaration so _absorb can reuse _project_batch defined below */
+int coli_cuda_attention_project_batch(ColiCudaTensor*kv,ColiCudaTensor*o,float*out,const float*q,const float*l,const float*r,int S,int H,int Q,int R,int V,int K,int T,float sc);
+
+/* CPU reference port of glm.c attention, CAUSAL (matches the Vulkan batch kernel:
+ * position s attends to t in [0, T-S+s]). Used only by COLI_ATTN_DEBUG. Reads
+ * weights by copying the GPU buffer into a staging buffer (avoids remap crash). */
+static void attn_cpu_ref(const ColiCudaTensor*kv,float*c,const float*q,const float*l,
+                         const float*r,int S,int H,int Q,int R,int V,int K,int T,float sc){
+    int rb=(K+1)/2; size_t wb=kv->wbytes, sb=kv->sbytes;
+    uint8_t*w=malloc(wb); float*ws=malloc(sb);
+    void*pp;
+    vkMapMemory(g_dev,kv->wmem,0,wb,0,&pp); memcpy(w,pp,wb); vkUnmapMemory(g_dev,kv->wmem);
+    vkMapMemory(g_dev,kv->smem,0,sb,0,&pp); memcpy(ws,pp,sb); vkUnmapMemory(g_dev,kv->smem);
+    for(int s=0;s<S;s++){
+        int nt=T-S+s+1;
+        for(int h=0;h<H;h++){
+            int rbase=h*(Q+V); int qoff=(s*H+h)*(Q+R);
+            float*qa=malloc((size_t)K*sizeof(float));
+            for(int k=0;k<K;k++){ float a=0; for(int d=0;d<Q;d++){
+                uint8_t b=w[((size_t)rbase+d)*rb+(k>>1)]; int nib=(k&1)?b>>4:b&15;
+                a+=q[qoff+d]*((float)nib-8.0f)*ws[rbase+d]; } qa[k]=a; }
+            float*scv=malloc((size_t)nt*sizeof(float)); float mx=-1e30f;
+            for(int t=0;t<nt;t++){ float a=0; for(int k=0;k<K;k++)a+=qa[k]*l[(size_t)t*K+k];
+                for(int d=0;d<R;d++)a+=q[qoff+Q+d]*r[(size_t)t*R+d];
+                scv[t]=a*sc; if(scv[t]>mx)mx=scv[t]; }
+            float sum=0; for(int t=0;t<nt;t++){ scv[t]=expf(scv[t]-mx); sum+=scv[t]; }
+            float inv=1.0f/sum; float*cl=malloc((size_t)K*sizeof(float));
+            for(int k=0;k<K;k++){ float a=0; for(int t=0;t<nt;t++)a+=scv[t]*inv*l[(size_t)t*K+k]; cl[k]=a; }
+            for(int v=0;v<V;v++){ int row=rbase+Q+v; float a=0;
+                for(int k=0;k<K;k++){ uint8_t b=w[((size_t)row)*rb+(k>>1)]; int nib=(k&1)?b>>4:b&15;
+                    a+=cl[k]*((float)nib-8.0f); }
+                c[((size_t)s*H+h)*V+v]=a*ws[row]; }
+            free(qa); free(scv); free(cl);
+        }
+    }
+    free(w); free(ws);
+}
+
+/* PATH-2 CPU reference: reconstruct kvb = matmul_qt(Lc,kv_b) then attend with raw q.
+ * Mirrors glm.c attention_rows() so we can diff the GPU R+S shaders against it. */
+static void attn_cpu_ref_path2(const ColiCudaTensor*kv,float*c,const float*q,const float*l,
+                               const float*r,int S,int H,int Q,int R,int V,int K,int T,float sc){
+    int rb=(K+1)/2; int kvb_dim=H*(Q+V); size_t wb=kv->wbytes, sb=kv->sbytes;
+    uint8_t*w=malloc(wb); float*ws=malloc(sb);
+    void*pp;
+    vkMapMemory(g_dev,kv->wmem,0,wb,0,&pp); memcpy(w,pp,wb); vkUnmapMemory(g_dev,kv->wmem);
+    vkMapMemory(g_dev,kv->smem,0,sb,0,&pp); memcpy(ws,pp,sb); vkUnmapMemory(g_dev,kv->smem);
+    float*kvb=malloc((size_t)T*kvb_dim*sizeof(float));
+    for(int t=0;t<T;t++) for(int rr=0;rr<kvb_dim;rr++){
+        float a=0; for(int d=0;d<K;d++){ uint8_t b=w[((size_t)rr)*rb+(d>>1)]; int nib=(d&1)?b>>4:b&15;
+            a+=l[(size_t)t*K+d]*((float)nib-8.0f)*ws[rr]; }
+        kvb[(size_t)t*kvb_dim+rr]=a;
+    }
+    for(int s=0;s<S;s++){
+        int nt=T-S+s+1;
+        for(int h=0;h<H;h++){
+            int rbase=h*(Q+V); int qoff=(s*H+h)*(Q+R);
+            float*scv=malloc((size_t)nt*sizeof(float)); float mx=-1e30f;
+            for(int t=0;t<nt;t++){ float a=0;
+                for(int k=0;k<Q;k++) a+=q[qoff+k]*kvb[(size_t)t*kvb_dim+rbase+k];
+                for(int d=0;d<R;d++) a+=q[qoff+Q+d]*r[(size_t)t*R+d];
+                scv[t]=a*sc; if(scv[t]>mx)mx=scv[t]; }
+            float sum=0; for(int t=0;t<nt;t++){ scv[t]=expf(scv[t]-mx); sum+=scv[t]; }
+            float inv=1.0f/(sum>0?sum:1.0f); float*cl=malloc((size_t)V*sizeof(float));
+            for(int v=0;v<V;v++) cl[v]=0;
+            for(int t=0;t<nt;t++){ float ww=scv[t]*inv;
+                for(int v=0;v<V;v++) cl[v]+=ww*kvb[(size_t)t*kvb_dim+rbase+Q+v]; }
+            for(int v=0;v<V;v++) c[((size_t)s*H+h)*V+v]=cl[v];
+            free(scv); free(cl);
+        }
+    }
+    free(w); free(ws); free(kvb);
+}
+
+int coli_cuda_attention_absorb(ColiCudaTensor*kv,float*c,const float*q,const float*l,const float*r,int H,int Q,int R,int V,int K,int T,float sc){
+    if(!kv||!c||!q||!l||!r||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
+       kv->I!=K||kv->O!=H*(Q+V)) return 0;
+    int ok=coli_cuda_attention_project_batch(kv,NULL,c,q,l,r,1,H,Q,R,V,K,T,sc);
+    if(getenv("COLI_ATTN_DEBUG")){
+        static int dbg=0;
+        if(dbg<12){
+            float*ref=malloc((size_t)H*V*sizeof(float));
+            attn_cpu_ref(kv,ref,q,l,r,1,H,Q,R,V,K,T,sc);
+            float md=0; for(int i=0;i<H*V;i++){ float d=fabsf(ref[i]-c[i]); if(d>md)md=d; }
+            fprintf(stderr,"[ATTN-DBG] call %d T=%d H=%d V=%d K=%d Q=%d R=%d scale=%.6f maxdiff=%.6f\n",
+                    dbg,T,H,V,K,Q,R,sc,md);
+            free(ref); dbg++;
+        }
+    }
+    return ok;
+}
+int coli_cuda_attention_absorb_batch(ColiCudaTensor*kv,float*c,const float*q,const float*l,const float*r,int S,int H,int Q,int R,int V,int K,int T,float sc){
+    if(!kv||!c||!q||!l||!r||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||T<S||T>8192||
+       kv->I!=K||kv->O!=H*(Q+V)) return 0;
+    return coli_cuda_attention_project_batch(kv,NULL,c,q,l,r,S,H,Q,R,V,K,T,sc);
+}
+int coli_cuda_attention_project_batch(ColiCudaTensor*kv,ColiCudaTensor*o,float*out,const float*q,const float*l,const float*r,int S,int H,int Q,int R,int V,int K,int T,float sc){
+    static int _dbg_sb=0; if(!_dbg_sb){ setvbuf(stderr,NULL,_IONBF,0); _dbg_sb=1; }
+    if(!kv||!out||!q||!l||!r||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||T<S||T>8192||
+       kv->I!=K||kv->O!=H*(Q+V)) return 0;
+    double _t0=now_s(), _t_alloc=0,_t_sub=0,_t_wait=0,_t_free=0; int _timing=!!getenv("COLI_ATTN_TIMING");
+    #define _TACC(var) do{ double _n=now_s(); var+=(_n-_t0); _t0=_n; }while(0)
+    if(_timing){ static int _fc=0; if(_fc<1){ fprintf(stderr,"[ATTN-TIMING] ENTER S=%d H=%d V=%d K=%d T=%d o=%p\n",S,H,V,K,T,(void*)o); _fc++; } }
+    if(o && (o->device!=kv->device || o->I!=H*V)) return 0;
+    if(g_attn_failed) return 0;
+    if(!g_mod_attn_r){ g_mod_attn_r=load_module(S_ATTN_R); if(!g_mod_attn_r){ g_attn_failed=1; return 0; } }
+    if(!g_mod_attn_s){ g_mod_attn_s=load_module(S_ATTN_S); if(!g_mod_attn_s){ g_attn_failed=1; return 0; } }
+    if(o && !g_mod_attn_o){ g_mod_attn_o=load_module(S_ATTN_O); if(!g_mod_attn_o){ g_attn_failed=1; return 0; } }
+    int Iw=(K+1)/2;          /* kv_b int4 row bytes */
+    int Io=(H*V+1)/2;        /* o_proj int4 row bytes */
+    if(getenv("COLI_ATTN_DEBUG")&&dbg_attn_init<1){
+        fprintf(stderr,"[ATTN-DBG] mod_attn_r=%p failed=%d Iw=%d Io=%d K=%d V=%d H=%d S=%d T=%d wbuf_ok=%d\n",(void*)g_mod_attn_r,g_attn_failed,Iw,Io,K,V,H,S,T,(int)(kv->wbytes>0));
+        uint8_t*cpum=kv->wmem?(uint8_t*)kv->wmem:NULL;
+        uint8_t*cpub=kv->wbuf?(uint8_t*)kv->wbuf:NULL;
+        if(cpum) fprintf(stderr,"[ATTN-DBG] CPU wmem[192*256]=0x%02x  [0]=0x%02x\n", cpum[192*256], cpum[0]);
+        if(cpub){ void*mpp; if(vkMapMemory(g_dev,kv->wmem,0,kv->wbytes,0,&mpp)==VK_SUCCESS){ uint8_t*mb=(uint8_t*)mpp; fprintf(stderr,"[ATTN-DBG] GPU wbuf[192*256]=0x%02x  [0]=0x%02x (mapped via wmem)\n", mb[192*256], mb[0]); vkUnmapMemory(g_dev,kv->wmem); } }
+        dbg_attn_init++;
+    }
+    size_t qb=(size_t)S*H*(Q+R)*sizeof(float), lb=(size_t)T*K*sizeof(float);
+    size_t rb=(size_t)T*R*sizeof(float), cb=(size_t)S*H*V*sizeof(float);
+    size_t ob = o ? (size_t)S*o->O*sizeof(float) : cb;
+    int kvb_dim=H*(Q+V);
+    size_t kvbb=(size_t)T*kvb_dim*sizeof(float);   /* reconstructed k_nope||v per position */
+    VkBuffer qbuf,lbuf,rbuf,cbuf,obuf,kvbbuf; VkDeviceMemory qm,lm,rm,cm,om,kvbm;
+    void *qmap,*lmap,*rmap,*cmap,*omap,*kvbmap;
+    qbuf=pb_get(0,qb,&qm,&qmap); lbuf=pb_get(1,lb,&lm,&lmap); rbuf=pb_get(2,rb,&rm,&rmap);
+    cbuf=pb_get(3,cb,&cm,&cmap); obuf=pb_get(4,ob,&om,&omap); kvbbuf=pb_get(5,kvbb,&kvbm,&kvbmap);
+    if(!qbuf||!lbuf||!rbuf||!cbuf||!obuf||!kvbbuf) return 0;
+    if(_timing) _TACC(_t_alloc);
+    memcpy(qmap,q,qb);
+    memcpy(lmap,l,lb);
+    memcpy(rmap,r,rb);
+    if(!attn_ensure_resources()) return 0;
+    vkResetCommandBuffer(g_attn_cb,0);
+    vkBeginCommandBuffer(g_attn_cb,&(VkCommandBufferBeginInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
+    /* PATH-2 reconstruction: kvb[t,r] = sum_d Lc[t,d]*wgt(r,d)*sc[r]  (R shader) */
+    attn_record(g_mod_attn_r, g_attn_ds[0], 4, kv->wbuf, kv->sbuf, lbuf, kvbbuf, kvbbuf, kvbbuf,
+                (uint32_t)kvb_dim, (uint32_t)T, S,H,Q,R,V,K,T,0, Iw, sc);
+    { VkBufferMemoryBarrier bmb={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.buffer=kvbbuf,.offset=0,.size=VK_WHOLE_SIZE,
+        .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT};
+      vkCmdPipelineBarrier(g_attn_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,NULL, 1,&bmb, 0,NULL); }
+    /* PATH-2 attend: score raw q vs kvb k_nope + rope, softmax, aggregate v  (S shader) */
+    attn_record(g_mod_attn_s, g_attn_ds[1], 4, kvbbuf, qbuf, rbuf, cbuf, cbuf, cbuf,
+                 (uint32_t)((int64_t)H*V), (uint32_t)S, S,H,Q,R,V,K,T,0, Iw, sc);
+    { VkBufferMemoryBarrier bmb={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.buffer=cbuf,.offset=0,.size=VK_WHOLE_SIZE,
+        .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT};
+      vkCmdPipelineBarrier(g_attn_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,NULL, 1,&bmb, 0,NULL); }
+    if(o){
+        attn_record(g_mod_attn_o, g_attn_ds[2], 4, o->wbuf, o->sbuf, cbuf, obuf, cbuf, obuf,
+                      (uint32_t)o->O, (uint32_t)S, S,H,Q,R,V,K,T, o->O, Io, sc);
+    }
+    VkResult e1=vkEndCommandBuffer(g_attn_cb);
+    if(e1!=VK_SUCCESS) fprintf(stderr,"[ATTN-DBG] vkEndCommandBuffer=%d\n",(int)e1);
+    vkResetFences(g_dev,1,&g_fence);
+    VkResult e2=vkQueueSubmit(g_queue,1,&(VkSubmitInfo){.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&g_attn_cb},g_fence);
+    if(e2!=VK_SUCCESS) fprintf(stderr,"[ATTN-DBG] vkQueueSubmit=%d\n",(int)e2);
+    if(_timing) _TACC(_t_sub);
+    VkResult e3=vkWaitForFences(g_dev,1,&g_fence,VK_TRUE,~0ULL);
+    if(e3!=VK_SUCCESS) fprintf(stderr,"[ATTN-DBG] vkWaitForFences=%d\n",(int)e3);
+    if(_timing) _TACC(_t_wait);
+
+    if(_timing){ static double sa=0,ss=0,sw=0,sf=0; static int nc=0;
+        sa+=_t_alloc; ss+=_t_sub; sw+=_t_wait; sf+=_t_free; nc++;
+        if(nc%78==0) fprintf(stderr,"[ATTN-TIMING] calls=%d total alloc=%.2fms submit=%.2fms wait=%.2fms (per-call a=%.4f s=%.4f w=%.4f)\n",
+            nc, sa*1000, ss*1000, sw*1000, _t_alloc*1000, _t_sub*1000, _t_wait*1000); }
+    if(o){
+        memcpy(out,omap,ob);
+    } else {
+        memcpy(out,cmap,cb);
+    }
+    if(getenv("COLI_ATTN_DEBUG")){
+        float*ref=malloc((size_t)S*H*V*sizeof(float));
+        attn_cpu_ref_path2(kv,ref,q,l,r,S,H,Q,R,V,K,T,sc);
+        const float*cc = (const float*)cmap;
+        static int dbg2=0;
+        if(dbg2<12){
+            float md=0; int ami=0;
+            for(int i=0;i<S*H*V;i++){ float d=fabsf(ref[i]-cc[i]); if(d>md){md=d;ami=i;} }
+            fprintf(stderr,"[ATTN-DBG] path2 ctx call %d S=%d T=%d H=%d V=%d K=%d Q=%d R=%d scale=%.6f ctx_maxdiff=%.6f argmax_i=%d (s=%d h=%d v=%d) gpu=%.6f ref=%.6f\n",
+                    dbg2,S,T,H,V,K,Q,R,sc,md,ami,ami/(H*V), (ami/V)%H, ami%(H*V)%V, cc[ami], ref[ami]);
+        }
+        if(getenv("COLI_ATTN_DEBUG") && getenv("COLI_ATTN_DBG_O") && o){
+            static int dbg3=0;
+            if(dbg3<12){
+                int HV=H*V, D=o->O; float*oref=malloc((size_t)S*D*sizeof(float)); float*ws=malloc((size_t)D*sizeof(float));
+                uint8_t*ow=malloc(o->wbytes); void*op;
+                vkMapMemory(g_dev,o->wmem,0,o->wbytes,0,&op); memcpy(ow,op,o->wbytes); vkUnmapMemory(g_dev,o->wmem);
+                vkMapMemory(g_dev,o->smem,0,o->sbytes,0,&op); memcpy(ws,op,o->sbytes); vkUnmapMemory(g_dev,o->smem);
+                int rb=(HV+1)/2; const float*cc2=(const float*)cmap;
+                for(int s=0;s<S;s++) for(int d=0;d<D;d++){
+                    double a=0; for(int hv=0;hv<HV;hv++){
+                        uint8_t b=ow[((size_t)d)*rb+(hv>>1)]; int nib=(hv&1)?b>>4:b&15;
+                        a+=cc2[((size_t)s*HV)+hv]*((double)nib-8.0); }
+                    oref[((size_t)s*D)+d]=(float)(a*ws[d]); }
+                float md=0; const float*oo=(const float*)omap;
+                for(int i=0;i<S*D;i++){ float dd=fabsf(oref[i]-oo[i]); if(dd>md)md=dd; }
+                fprintf(stderr,"[ATTN-DBG] oproj call %d S=%d D=%d HV=%d oproj_maxdiff=%.6f\n", dbg3,S,D,HV,md);
+                free(oref); free(ws); free(ow); dbg3++;
+            }
+        }
+        if(getenv("COLI_ATTN_DUMP_KVB")){
+            int rb=(K+1)/2; uint8_t*ww=malloc(kv->wbytes); float*ws=malloc(kv->sbytes); void*mp;
+            vkMapMemory(g_dev,kv->wmem,0,kv->wbytes,0,&mp); memcpy(ww,mp,kv->wbytes); vkUnmapMemory(g_dev,kv->wmem);
+            vkMapMemory(g_dev,kv->smem,0,kv->sbytes,0,&mp); memcpy(ws,mp,kv->sbytes); vkUnmapMemory(g_dev,kv->smem);
+            /* download kvb device buffer to a temp staging to compare */
+            size_t ksz=kvbb; VkBuffer tk; VkDeviceMemory tkm; tk=make_buf(ksz,&tkm); void* tkp;
+            VkBufferCopy cp={0,0,(VkDeviceSize)ksz};
+            vkResetCommandBuffer(g_attn_cb,0);
+            vkBeginCommandBuffer(g_attn_cb,&(VkCommandBufferBeginInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
+            vkCmdCopyBuffer(g_attn_cb,kvbbuf,tk,1,&cp);
+            vkEndCommandBuffer(g_attn_cb); vkResetFences(g_dev,1,&g_fence);
+            vkQueueSubmit(g_queue,1,&(VkSubmitInfo){.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&g_attn_cb},g_fence);
+            vkWaitForFences(g_dev,1,&g_fence,VK_TRUE,~0ULL);
+            vkMapMemory(g_dev,tkm,0,ksz,0,&tkp); float*kvbg=(float*)tkp;
+            float kvbmd=0,intmi=0; for(int t=0;t<T;t++) for(int rr=0;rr<kvb_dim;rr++){
+                float a=0; for(int d=0;d<K;d++){ uint8_t b=ww[((size_t)rr)*rb+(d>>1)]; int nib=(d&1)?b>>4:b&15; a+=l[(size_t)t*K+d]*((float)nib-8.0f)*ws[rr]; }
+                float ddiff=fabsf(a-kvbg[(size_t)t*kvb_dim+rr]); if(ddiff>kvbmd){kvbmd=ddiff;intmi=(int)((size_t)t*kvb_dim+rr);} }
+            fprintf(stderr,"[ATTN-DBG] R kvb_maxdiff=%.6f at idx=%d (t=%d r=%d)\n", kvbmd, intmi, intmi/kvb_dim, intmi-(intmi/kvb_dim)*kvb_dim);
+            vkUnmapMemory(g_dev,tkm); vkDestroyBuffer(g_dev,tk,NULL); vkFreeMemory(g_dev,tkm,NULL);
+            free(ww);free(ws);
+        }
+        free(ref); dbg2++;
+    }
+    if(_timing) _TACC(_t_free);   /* free phase now covers only the (cheap) final sync */
+    return 1;
+}
 int coli_cuda_attention_project_batch_dev(ColiCudaTensor*kv,ColiCudaTensor*o,float*out,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)o;(void)out;(void)qd;(void)ld;(void)rd;(void)S;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
 int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor*kvb,float*cd,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){(void)kvb;(void)cd;(void)qd;(void)ld;(void)rd;(void)S;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
 int coli_cuda_attention_absorb_kvdev(ColiCudaTensor*kv,float*c,const float*q,const float*ld,const float*rd,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)c;(void)q;(void)ld;(void)rd;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
