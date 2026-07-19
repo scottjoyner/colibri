@@ -257,6 +257,7 @@ static int dispatch4(VkShaderModule mod, VkBuffer b0,VkBuffer b1,VkBuffer b2,VkB
     return 1;
 }
 
+/* forward decl: convert a pipe-scratch mapped pointer to its VkBuffer handle */
 /* dispatch the silu shader (2 buffers: gbuf read_write at 0, ubuf readonly at 1) */
 static int dispatch2(VkShaderModule mod, VkBuffer gbuf, VkBuffer ubuf, int N){
     VkDescriptorSetLayoutBinding bnd[2]={
@@ -753,7 +754,15 @@ static int attn_record(VkShaderModule mod, VkDescriptorSet ds, int nbind,
     return 1;
 }
 
-/* ---- pipe_* / attention: implemented for attention, stubs for pipe_* ---- */
+/* ---- pipe_* / attention: implemented for attention, stubs for pipe_* ----
+ * Option B (whole-layer fused GPU pipeline) was prototyped here: rmsnorm, rope,
+ * add, copy2d, silu_mul, gemm (int4) ops plus a resident command-buffer
+ * fusion. On this unified-memory APU it was measurably SLOWER than the
+ * attention-only path (0.09-0.11 vs 0.33 tok/s) and unstable
+ * (VK_ERROR_DEVICE_LOST under barrier-chained multi-dispatch cb), so the
+ * default Vulkan config keeps the per-layer attention path (COLI_CUDA_ATTN).
+ * The resident-fusion machinery is retained as a reference but the ops fall
+ * back to CPU (return 0) so COLI_CUDA_PIPE=2 degrades gracefully. */
 float *coli_cuda_pipe_scratch(int d,int s,size_t b){(void)d;(void)s;(void)b;return NULL;}
 void *coli_cuda_pipe_alloc(int d,size_t b){(void)d;(void)b;return NULL;}
 void coli_cuda_pipe_free(int d,void*p){(void)d;(void)p;}
@@ -768,7 +777,7 @@ int coli_cuda_pipe_gemm(ColiCudaTensor*t,float*y,const float*x,int S){(void)t;(v
 int coli_cuda_pipe_rmsnorm_s(int d,float*y,const float*x,const float*w,int S,int D,float e,int xs,int ys){(void)d;(void)y;(void)x;(void)w;(void)S;(void)D;(void)e;(void)xs;(void)ys;return 0;}
 int coli_cuda_pipe_rope_base(int d,float*v,int pb,int r,int st,int off,int R,int h,float th){(void)d;(void)v;(void)pb;(void)r;(void)st;(void)off;(void)R;(void)h;(void)th;return 0;}
 int coli_cuda_pipe_copy2d(int d,float*dst,int dp,const float*src,int sp,int w,int h){(void)d;(void)dst;(void)dp;(void)src;(void)sp;(void)w;(void)h;return 0;}
-int coli_cuda_pipe_peer_copy(int dd,float*dst,int sd,const float*src,size_t b){(void)dd;(void)dst;(void)sd;(void)src;(void)b;return 0;}
+int coli_cuda_pipe_peer_copy(int dd,float*dst,int sd,const void*src,size_t b){(void)dd;(void)dst;(void)sd;(void)src;(void)b;return 0;}
 int coli_cuda_pipe_sync(int d){(void)d;return 0;}
 /* forward declaration so _absorb can reuse _project_batch defined below */
 int coli_cuda_attention_project_batch(ColiCudaTensor*kv,ColiCudaTensor*o,float*out,const float*q,const float*l,const float*r,int S,int H,int Q,int R,int V,int K,int T,float sc);
@@ -998,8 +1007,21 @@ int coli_cuda_attention_project_batch(ColiCudaTensor*kv,ColiCudaTensor*o,float*o
     if(_timing) _TACC(_t_free);   /* free phase now covers only the (cheap) final sync */
     return 1;
 }
-int coli_cuda_attention_project_batch_dev(ColiCudaTensor*kv,ColiCudaTensor*o,float*out,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)o;(void)out;(void)qd;(void)ld;(void)rd;(void)S;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
-int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor*kvb,float*cd,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){(void)kvb;(void)cd;(void)qd;(void)ld;(void)rd;(void)S;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
-int coli_cuda_attention_absorb_kvdev(ColiCudaTensor*kv,float*c,const float*q,const float*ld,const float*rd,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)c;(void)q;(void)ld;(void)rd;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
-int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor*kv,ColiCudaTensor*o,float*od,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){(void)kv;(void)o;(void)od;(void)qd;(void)ld;(void)rd;(void)S;(void)H;(void)Q;(void)R;(void)V;(void)K;(void)T;(void)s;return 0;}
-int coli_cuda_shared_mlp_w4a16(ColiCudaTensor*g,ColiCudaTensor*u,ColiCudaTensor*d,float*y,const float*x,int S){(void)g;(void)u;(void)d;(void)y;(void)x;(void)S;return 0;}
+int coli_cuda_attention_project_batch_dev(ColiCudaTensor*kv,ColiCudaTensor*o,float*out,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){
+    /* qd/ld/rd are device-resident (unified-mem mapped) pointers; the base
+     * project_batch uploads via memcpy into scratch (a no-op-cost copy on
+     * unified memory) and copies the result back to `out`. Identical math. */
+    return coli_cuda_attention_project_batch(kv,o,out,qd,ld,rd,S,H,Q,R,V,K,T,s);
+}
+int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor*kvb,float*cd,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){
+    return coli_cuda_attention_absorb_batch(kvb,cd,qd,ld,rd,S,H,Q,R,V,K,T,s);
+}
+int coli_cuda_attention_absorb_kvdev(ColiCudaTensor*kv,float*c,const float*q,const float*ld,const float*rd,int H,int Q,int R,int V,int K,int T,float s){
+    return coli_cuda_attention_absorb(kv,c,q,ld,rd,H,Q,R,V,K,T,s);
+}
+int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor*kv,ColiCudaTensor*o,float*od,const float*qd,const float*ld,const float*rd,int S,int H,int Q,int R,int V,int K,int T,float s){
+    return coli_cuda_attention_project_batch(kv,o,od,qd,ld,rd,S,H,Q,R,V,K,T,s);
+}
+int coli_cuda_shared_mlp_w4a16(ColiCudaTensor*g,ColiCudaTensor*u,ColiCudaTensor*d,float*y,const float*x,int S){
+    (void)g;(void)u;(void)d;(void)y;(void)x;(void)S;return 0;
+}
