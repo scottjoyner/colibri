@@ -70,3 +70,5 @@ c/tests/test_idot
 c/tests/test_uring
 c/backend_vulkan.o
 c/tests/bench_matmul
+c/tests/bench_attn
+c/tests/bench_attn_baseline

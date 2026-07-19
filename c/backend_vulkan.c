@@ -96,7 +96,7 @@ static const char* S_MATMUL =
 "  for(uint k0=0u;k0<I;k0+=" XSTR(TM_TILE_K) "){\n"
 "    for(uint e=lx+ly*" XSTR(TM_TILE_O) "; e<" XSTR(TM_TILE_O) "*" XSTR(TM_TILE_K) "; e+=" XSTR(TM_TILE_O) "*" XSTR(TM_TILE_S) "){\n"
 "      uint tk=e%" XSTR(TM_TILE_K) "; uint to=e/" XSTR(TM_TILE_K) ";\n"
-"      uint gk=k0+tk; uint go=o0-to+lx; uint gs=s0-to+ly;\n"
+"      uint gk=k0+tk; uint go=o0-lx+to; uint gs=s0-ly+to;\n"
 "      if(go<O && tk<(I-k0)) smW[to*" XSTR(TM_TILE_K) "+tk]=float(wgt(go,gk)); else smW[to*" XSTR(TM_TILE_K) "+tk]=0.0f;\n"
 "      if(gs<S && tk<(I-k0)) smX[to*" XSTR(TM_TILE_K) "+tk]=x[gs*I+gk]; else smX[to*" XSTR(TM_TILE_K) "+tk]=0.0f;\n"
 "    }\n"
@@ -559,35 +559,57 @@ int coli_cuda_tensor_update(ColiCudaTensor *tensor, const void *weights, const f
  *   i i i i i i i  i  i  i   f
  * O = out dim (D) for o_proj, unused in absorb. I = weight row len in bytes'
  * (K+1)/2 for absorb, (H*V+1)/2 for o_proj. */
-/* S_ATTN_R: PATH-2 reconstruction. Builds kvb[t, r] = sum_d Lc[t,d] * wgt(r,d) * sc[r]
- * for every position t (0..T-1) and every kv_b row r (0..H*(Q+V)-1). This is exactly
- * matmul_qt(Lc, kv_b) (the k_nope || v reconstruction the default CPU path does), so the
- * GPU now follows the same formulation as the CPU reference. Output: kvb[T][H*(Q+V)]. */
+/* S_ATTN_R: PATH-2 reconstruction. kvb[t, r] = sc[r] * (Lc[t,:] . W[r,:]), i.e. a
+ * matmul Y[T,kvb_dim] = Lc[T,K] @ W[kvb_dim,K]^T with per-row scale sc[r]. The naive
+ * kernel strided K/2 bytes apart per weight row (same pathology as the old matmul).
+ * Tiled shared-memory GEMM: one workgroup computes a tileR x tileT block of kvb, loading
+ * dequantized W-tile and Lc-tile into shared memory cooperatively. */
+#define TR_TILE_R 8
+#define TR_TILE_T 8
+#define TR_TILE_K 32
 static const char* S_ATTN_R =
 "#version 450\n"
-"layout(local_size_x=64) in;\n"
+"layout(local_size_x=" XSTR(TR_TILE_R) ", local_size_y=" XSTR(TR_TILE_T) ") in;\n"
 "layout(std430,binding=0) readonly buffer Wbuf { uint w[]; };\n"
 "layout(std430,binding=1) readonly buffer Sbuf { float sc[]; };\n"
 "layout(std430,binding=2) readonly buffer Lbuf { float lat[]; };\n"
 "layout(std430,binding=3) writeonly buffer KVbuf { float kvb[]; };\n"
 "layout(push_constant) uniform PC { int S; int H; int Q; int R; int V; int K; int T; int O; int I; int pad; float scale; } pc;\n"
+"shared float smW[" XSTR(TR_TILE_R) "*" XSTR(TR_TILE_K) "];\n"
+"shared float smL[" XSTR(TR_TILE_T) "*" XSTR(TR_TILE_K) "];\n"
 "int wgt(uint row,uint k){ uint rb=uint(pc.I); uint bo=row*rb+(k>>1u); uint byte=(w[bo>>2u] >> ((bo&3u)*8u)) & 0xFFu; int nib=(k&1u)!=0?int(byte>>4u):int(byte&0xFu); return nib-8; }\n"
 "void main(){\n"
-"  uint r=gl_GlobalInvocationID.x;        // kv_b row (head*((Q+V)) + local)\n"
-"  uint t=gl_GlobalInvocationID.y;        // KV position\n"
-"  int kvb_dim=pc.H*(pc.Q+pc.V);\n"
-"  if(r>=uint(kvb_dim) || t>=uint(pc.T)) return;\n"
-"  float a=0.0f;\n"
-"  for(int d=0;d<pc.K;d++){ a += lat[(uint(t)*uint(pc.K))+uint(d)] * float(wgt(r,uint(d))) * sc[r]; }\n"
-"  kvb[(uint(t)*uint(kvb_dim))+r]=a;\n"
+"  uint r0=(gl_WorkGroupID.x*" XSTR(TR_TILE_R) ")+gl_LocalInvocationID.x;\n"
+"  uint t0=(gl_WorkGroupID.y*" XSTR(TR_TILE_T) ")+gl_LocalInvocationID.y;\n"
+"  uint lx=gl_LocalInvocationID.x, ly=gl_LocalInvocationID.y;\n"
+"  uint K=uint(pc.K), R=uint(pc.H*(pc.Q+pc.V)), T=uint(pc.T);\n"
+"  float acc=0.0f;\n"
+"  for(uint k0=0u;k0<K;k0+=" XSTR(TR_TILE_K) "){\n"
+"    for(uint e=lx+ly*" XSTR(TR_TILE_R) "; e<" XSTR(TR_TILE_R) "*" XSTR(TR_TILE_K) "; e+=" XSTR(TR_TILE_R) "*" XSTR(TR_TILE_T) "){\n"
+"      uint tk=e%" XSTR(TR_TILE_K) "; uint tr=e/" XSTR(TR_TILE_K) ";\n"
+"      uint gk=k0+tk; uint gr=r0-lx+tr; uint gt=t0-ly+tr;\n"
+"      if(gr<R && tk<(K-k0)) smW[tr*" XSTR(TR_TILE_K) "+tk]=float(wgt(gr,gk)); else smW[tr*" XSTR(TR_TILE_K) "+tk]=0.0f;\n"
+"      if(gt<T && tk<(K-k0)) smL[tr*" XSTR(TR_TILE_K) "+tk]=lat[(gt*K)+gk]; else smL[tr*" XSTR(TR_TILE_K) "+tk]=0.0f;\n"
+"    }\n"
+"    barrier();\n"
+"    if(r0<R && t0<T){\n"
+"      for(uint k=0u;k<" XSTR(TR_TILE_K) ";k++) acc += smL[ly*" XSTR(TR_TILE_K) "+k]*smW[lx*" XSTR(TR_TILE_K) "+k];\n"
+"    }\n"
+"    barrier();\n"
+"  }\n"
+"  if(r0<R && t0<T) kvb[(t0*R)+r0]=acc*sc[r0];\n"
 "}\n";
 
-/* S_ATTN_S: PATH-2 attention. One thread per (s,h,v): online-softmax over t.
- *   score = q[k_nope].kvb[t,h*(Q+V)+0..Q-1] + q_rope.rope[t], then
- *   ctx[s,h,v] = sum_t w[t]*kvb[t, h*(Q+V)+Q+v],  w=softmax(score*scale).
- * Parallel over V (H*S*V threads) for full occupancy; no per-thread stack
- * arrays. Reads kvb from S_ATTN_R. Causal: s attends t in [0, T-S+s]. */
-static const char* S_ATTN_S =
+/* S_ATTN_S: PATH-2 attention. One thread per (s,h,v): single-pass online
+ * softmax over t (Welford-style running max/sum), so the q.kvb score is
+ * computed ONCE per t instead of twice (the old two-pass kernel recomputed
+ * it). All 64 threads in a workgroup share the same (s,h) and thus the same
+ * q vector, so they cooperatively load q into shared memory once and read
+ * it from there in the t-loop (removes per-t global re-fetches of q).
+ *   score = q[k_nope].kvb[t,h*(Q+V)+0..Q-1] + q_rope.rope[t]
+ *   ctx[s,h,v] = (sum_t w[t]*kvb[t, h*(Q+V)+Q+v]) / (sum_t w[t])
+ *   w[t] = exp(score*scale - runningmax).  Causal: s attends t in [0,T-S+s]. */
+ static const char* S_ATTN_S =
 "#version 450\n"
 "layout(local_size_x=64) in;\n"
 "layout(std430,binding=0) readonly buffer KVbuf { float kvb[]; };\n"
@@ -595,6 +617,7 @@ static const char* S_ATTN_S =
 "layout(std430,binding=2) readonly buffer Rbuf { float rope[]; };\n"
 "layout(std430,binding=3) writeonly buffer Cbuf { float ctx[]; };\n"
 "layout(push_constant) uniform PC { int S; int H; int Q; int R; int V; int K; int T; int O; int I; int pad; float scale; } pc;\n"
+"shared float sq[256];\n"
 "void main(){\n"
 "  uint idx=gl_GlobalInvocationID.x;\n"
 "  uint s=gl_GlobalInvocationID.y;\n"
@@ -606,22 +629,21 @@ static const char* S_ATTN_S =
 "  int nt=pc.T-pc.S+int(s)+1;\n"
 "  if(nt<1) return;\n"
 "  int qoff=(int(s)*pc.H+int(h))*(pc.Q+pc.R);\n"
-"  /* pass 1: max score */\n"
-"  float mx=-1e30f;\n"
+"  int QR=pc.Q+pc.R;\n"
+"  for(uint i=gl_LocalInvocationID.x;i<uint(QR);i+=64u) sq[i]=q[qoff+int(i)];\n"
+"  barrier();\n"
+"  float m=-1e30f, l=0.0f, acc=0.0f;\n"
 "  for(int t=0;t<nt;t++){\n"
 "    float a=0.0f;\n"
-"    for(int k=0;k<pc.Q;k++){ a += q[qoff+k]*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+k)]; }\n"
-"    for(int d=0;d<pc.R;d++){ a += q[qoff+pc.Q+d]*rope[(uint(t)*uint(pc.R))+uint(d)]; }\n"
-"    float sc=a*pc.scale; if(sc>mx) mx=sc; }\n"
-"  /* pass 2: weighted sum of v */\n"
-"  float sum=0.0f, acc=0.0f;\n"
-"  for(int t=0;t<nt;t++){\n"
-"    float a=0.0f;\n"
-"    for(int k=0;k<pc.Q;k++){ a += q[qoff+k]*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+k)]; }\n"
-"    for(int d=0;d<pc.R;d++){ a += q[qoff+pc.Q+d]*rope[(uint(t)*uint(pc.R))+uint(d)]; }\n"
-"    float w=exp(a*pc.scale-mx); sum+=w;\n"
-"    acc += w*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+pc.Q+v)]; }\n"
-"  ctx[(uint(s)*uint(pc.H)+h)*uint(pc.V)+v]=acc/(sum>0.0f?sum:1.0f);\n"
+"    for(int k=0;k<pc.Q;k++) a += sq[k]*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+k)];\n"
+"    for(int d=0;d<pc.R;d++) a += sq[pc.Q+d]*rope[(uint(t)*uint(pc.R))+uint(d)];\n"
+"    float sc=a*pc.scale;\n"
+"    if(sc>m){ float r=exp(m-sc); l*=r; acc*=r; m=sc; }\n"
+"    float w=exp(sc-m);\n"
+"    l+=w;\n"
+"    acc += w*kvb[(uint(t)*uint(kvb_dim))+uint(rbase+pc.Q+v)];\n"
+"  }\n"
+"  ctx[(uint(s)*uint(pc.H)+h)*uint(pc.V)+v]=acc/(l>0.0f?l:1.0f);\n"
 "}\n";
 
 static const char* S_ATTN_O =
@@ -712,8 +734,9 @@ static AttnPipe* get_attn_pipe(VkShaderModule mod){
  * Updates the persistent descriptor set `ds` to point at b0..b5, binds it with
  * the given push constants, and emits a vkCmdDispatch. No submit/wait here. */
 static int attn_record(VkShaderModule mod, VkDescriptorSet ds, int nbind,
-                       VkBuffer b0,VkBuffer b1,VkBuffer b2,VkBuffer b3,VkBuffer b4,VkBuffer b5,
-                       uint32_t x,uint32_t y, int S,int H,int Q,int R,int V,int K,int T,int O,int I,float scale){
+                        VkBuffer b0,VkBuffer b1,VkBuffer b2,VkBuffer b3,VkBuffer b4,VkBuffer b5,
+                        uint32_t x,uint32_t y, int S,int H,int Q,int R,int V,int K,int T,int O,int I,float scale,
+                        uint32_t lx_dim,uint32_t ly_dim){
     AttnPipe* ap=get_attn_pipe(mod);
     if(!ap||!ap->ppl||!ds) return 0;
     VkBuffer bb[6]={b0,b1,b2,b3,b4,b5};
@@ -726,7 +749,7 @@ static int attn_record(VkShaderModule mod, VkDescriptorSet ds, int nbind,
     vkCmdBindPipeline(g_attn_cb,VK_PIPELINE_BIND_POINT_COMPUTE,ap->ppl);
     vkCmdBindDescriptorSets(g_attn_cb,VK_PIPELINE_BIND_POINT_COMPUTE,ap->pl,0,1,&ds,0,0);
     vkCmdPushConstants(g_attn_cb,ap->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,48,pcbuf);
-    vkCmdDispatch(g_attn_cb,(x+63)/64,(y>0?y:1),1);
+    vkCmdDispatch(g_attn_cb,(x+lx_dim-1)/lx_dim,(y>0?(y+ly_dim-1)/ly_dim:1),1);
     return 1;
 }
 
@@ -884,21 +907,21 @@ int coli_cuda_attention_project_batch(ColiCudaTensor*kv,ColiCudaTensor*o,float*o
     vkBeginCommandBuffer(g_attn_cb,&(VkCommandBufferBeginInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
     /* PATH-2 reconstruction: kvb[t,r] = sum_d Lc[t,d]*wgt(r,d)*sc[r]  (R shader) */
     attn_record(g_mod_attn_r, g_attn_ds[0], 4, kv->wbuf, kv->sbuf, lbuf, kvbbuf, kvbbuf, kvbbuf,
-                (uint32_t)kvb_dim, (uint32_t)T, S,H,Q,R,V,K,T,0, Iw, sc);
+                 (uint32_t)kvb_dim, (uint32_t)T, S,H,Q,R,V,K,T,0, Iw, sc, TR_TILE_R, TR_TILE_T);
     { VkBufferMemoryBarrier bmb={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.buffer=kvbbuf,.offset=0,.size=VK_WHOLE_SIZE,
         .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT};
-      vkCmdPipelineBarrier(g_attn_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+       vkCmdPipelineBarrier(g_attn_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,NULL, 1,&bmb, 0,NULL); }
     /* PATH-2 attend: score raw q vs kvb k_nope + rope, softmax, aggregate v  (S shader) */
     attn_record(g_mod_attn_s, g_attn_ds[1], 4, kvbbuf, qbuf, rbuf, cbuf, cbuf, cbuf,
-                 (uint32_t)((int64_t)H*V), (uint32_t)S, S,H,Q,R,V,K,T,0, Iw, sc);
+                 (uint32_t)((int64_t)H*V), (uint32_t)S, S,H,Q,R,V,K,T,0, Iw, sc, 64, 1);
     { VkBufferMemoryBarrier bmb={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.buffer=cbuf,.offset=0,.size=VK_WHOLE_SIZE,
         .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT};
       vkCmdPipelineBarrier(g_attn_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,NULL, 1,&bmb, 0,NULL); }
     if(o){
         attn_record(g_mod_attn_o, g_attn_ds[2], 4, o->wbuf, o->sbuf, cbuf, obuf, cbuf, obuf,
-                      (uint32_t)o->O, (uint32_t)S, S,H,Q,R,V,K,T, o->O, Io, sc);
+                      (uint32_t)o->O, (uint32_t)S, S,H,Q,R,V,K,T, o->O, Io, sc, 64, 1);
     }
     VkResult e1=vkEndCommandBuffer(g_attn_cb);
     if(e1!=VK_SUCCESS) fprintf(stderr,"[ATTN-DBG] vkEndCommandBuffer=%d\n",(int)e1);

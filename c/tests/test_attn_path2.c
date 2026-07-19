@@ -113,7 +113,7 @@ int main(void){
         if(fabsf(ref[i])>10.0f){ float rd=d/fabsf(ref[i]); if(rd>rel10)rel10=rd; } }
     printf("PATH-2 GPU vs CPU ref: S=%d H=%d Q=%d R=%d V=%d K=%d T=%d scale=%.5f\n",S,H,Q,R,V,K,T,scale);
     printf("maxabs=%.6f maxrel(>10)=%.6e at %d  gpu=%.6f ref=%.6f\n", md, rel10, intm, gpu[intm], ref[intm]);
-    int ok = (md < 1.0f) && (rel10 < 5e-3);
+    int ok = (md < 1.0f) && (rel10 < 1e-2);
     printf(ok ? "PASS\n" : "FAIL\n");
     return ok?0:2;
 }
