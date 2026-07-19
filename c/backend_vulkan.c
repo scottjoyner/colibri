@@ -66,25 +66,47 @@ static uint64_t g_calls=0, g_experts=0, g_rows=0;
 static double   g_h2d_ms=0, g_kernel_ms=0, g_d2h_ms=0;
 
 /* ---- shaders (GLSL, compiled to SPIR-V at init via glslangValidator) ---- */
+/* Tiled int4 GEMM: y[S,O] = x[S,I] @ W[O,I]^T, W int4 (signed nibbles, row scales).
+ * One workgroup computes a TILE_S x TILE_O block of y. For each K-tile it
+ * cooperatively loads a dequantized W-tile and an x-tile into shared memory
+ * (fast, coalesced global reads), then each thread accumulates from shared mem.
+ * This removes the catastrophic strided global reads of the naive kernel
+ * (which hit ~1 GMAC/s at O=16384 vs ~60 GMAC/s at O=2048). */
+#define TM_TILE_S 8
+#define TM_TILE_O 8
+#define TM_TILE_K 32
+#define STR(x) #x
+#define XSTR(x) STR(x)
 static const char* S_MATMUL =
 "#version 450\n"
-"layout(local_size_x=64) in;\n"
+"layout(local_size_x=" XSTR(TM_TILE_O) ", local_size_y=" XSTR(TM_TILE_S) ") in;\n"
 "layout(std430,binding=0) readonly buffer Wbuf { uint w[]; };\n"
 "layout(std430,binding=1) readonly buffer Sbuf { float sc[]; };\n"
 "layout(std430,binding=2) readonly buffer Xbuf { float x[]; };\n"
 "layout(std430,binding=3) writeonly buffer Ybuf { float y[]; };\n"
+"shared float smW[" XSTR(TM_TILE_O) "*" XSTR(TM_TILE_K) "];\n"
+"shared float smX[" XSTR(TM_TILE_S) "*" XSTR(TM_TILE_K) "];\n"
+"int wgt(uint row,uint k){ uint rb=uint((I_DIM+1)/2); uint bo=row*rb+(k>>1u); uint byte=(w[bo>>2u] >> ((bo&3u)*8u)) & 0xFFu; int nib=(k&1u)!=0?int(byte>>4u):int(byte&0xFu); return nib-8; }\n"
 "void main(){\n"
-"  uint o=gl_GlobalInvocationID.x; uint S=gl_GlobalInvocationID.y;\n"
-"  if(o>=uint(O_DIM) || S>=uint(S_DIM)) return;\n"
+"  uint o0=(gl_WorkGroupID.x*" XSTR(TM_TILE_O) ")+gl_LocalInvocationID.x;\n"
+"  uint s0=(gl_WorkGroupID.y*" XSTR(TM_TILE_S) ")+gl_LocalInvocationID.y;\n"
+"  uint lx=gl_LocalInvocationID.x, ly=gl_LocalInvocationID.y;\n"
+"  uint I=uint(I_DIM), O=uint(O_DIM), S=uint(S_DIM);\n"
 "  float acc=0.0f;\n"
-"  uint rb=uint((I_DIM+1)/2);\n"
-"  for(uint i=0u;i<uint(I_DIM);i++){\n"
-"    uint bo=o*rb + (i>>1u); uint byte=(w[bo>>2u] >> ((bo&3u)*8u)) & 0xFFu;\n"
-"    int nib = (i&1u)!=0u ? int(byte>>4u) : int(byte&0xFu);\n"
-"    int wq = nib-8;\n"
-"    acc += x[S*uint(I_DIM) + i] * float(wq);\n"
+"  for(uint k0=0u;k0<I;k0+=" XSTR(TM_TILE_K) "){\n"
+"    for(uint e=lx+ly*" XSTR(TM_TILE_O) "; e<" XSTR(TM_TILE_O) "*" XSTR(TM_TILE_K) "; e+=" XSTR(TM_TILE_O) "*" XSTR(TM_TILE_S) "){\n"
+"      uint tk=e%" XSTR(TM_TILE_K) "; uint to=e/" XSTR(TM_TILE_K) ";\n"
+"      uint gk=k0+tk; uint go=o0-to+lx; uint gs=s0-to+ly;\n"
+"      if(go<O && tk<(I-k0)) smW[to*" XSTR(TM_TILE_K) "+tk]=float(wgt(go,gk)); else smW[to*" XSTR(TM_TILE_K) "+tk]=0.0f;\n"
+"      if(gs<S && tk<(I-k0)) smX[to*" XSTR(TM_TILE_K) "+tk]=x[gs*I+gk]; else smX[to*" XSTR(TM_TILE_K) "+tk]=0.0f;\n"
+"    }\n"
+"    barrier();\n"
+"    if(o0<O && s0<S){\n"
+"      for(uint k=0u;k<" XSTR(TM_TILE_K) ";k++) acc += smX[ly*" XSTR(TM_TILE_K) "+k]*smW[lx*" XSTR(TM_TILE_K) "+k];\n"
+"    }\n"
+"    barrier();\n"
 "  }\n"
-"  y[S*uint(O_DIM) + o] = acc * sc[o];\n"
+"  if(o0<O && s0<S) y[s0*O+o0]=acc*sc[o0];\n"
 "}\n";
 
 static const char* S_SILU =
@@ -224,7 +246,7 @@ static int dispatch4(VkShaderModule mod, VkBuffer b0,VkBuffer b1,VkBuffer b2,VkB
     vkBeginCommandBuffer(cb,&(VkCommandBufferBeginInfo){.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO});
     vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,ppl);
     vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pl,0,1,&ds,0,0);
-    vkCmdDispatch(cb,(x+63)/64,(y>0?y:1),1);
+    vkCmdDispatch(cb,(x+TM_TILE_O-1)/TM_TILE_O,(y>0?(y+TM_TILE_S-1)/TM_TILE_S:1),1);
     vkEndCommandBuffer(cb);
     vkResetFences(g_dev,1,&g_fence);
     vkQueueSubmit(g_queue,1,&(VkSubmitInfo){.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cb},g_fence);
