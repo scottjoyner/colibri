@@ -5618,7 +5618,12 @@ static void run_serve(Model *m, const char *snap){
             double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
-            printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
+            printf("STAT %d %.2f %.1f %.2f %d %d", prod, prod/tdt,
+                (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb(), len, prod>=cur);
+            if(g_kvdb) printf(" kvdb=1 kvhot_n=%d kvhot_mb=%.1f kvhot_hits=%llu kvhot_loads=%llu",
+                g_kvhot_n, g_kvhot_bytes/1e6,
+                (unsigned long long)g_kvhot_hits, (unsigned long long)g_kvhot_loads);
+            printf("\n");
             fflush(stdout); kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         /* API mode: an exact, length-prefixed prompt. Unlike the interactive
@@ -6720,6 +6725,9 @@ int main(int argc, char **argv){
     g_kvdb = getenv("KVDB")?atoi(getenv("KVDB")):0;
     if(getenv("KVHOT_GB")){ double gb=atof(getenv("KVHOT_GB")); if(gb>0) g_kvhot_budget=(int64_t)(gb*1024*1024*1024); }
     if(g_kvdb) kvdb_path(snap);
+    if(g_kvdb) fprintf(stderr,"[KVDB] active: HOT RAM budget %.2f GB (%.0f MB), normalize=%d, store=%s\n",
+        g_kvhot_budget/1073741824.0, g_kvhot_budget/1e6,
+        getenv("KVDB_NORMALIZE")&&atoi(getenv("KVDB_NORMALIZE"))?1:0, g_kvdb_dir);
     if(g_kvdb && getenv("KVDB_PRIME")){
         /* PRIME HOT RAM + SSD da un file/dir di prompt (Hermes/opencode):
          * eseguito PRIMA di serve/text cosi' la primissima richiesta e' free. */

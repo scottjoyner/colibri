@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""glm — front-door CLI for the local colibri fleet.
+
+Routes by role to the right model/endpoint defined in configs/colibri.toml:
+
+    glm opencode            # serve the GLM-5.2 primary (heavy hitter) locally
+    glm hermes              # show helper endpoint status / connection info
+    glm hermes chat "..."   # send a chat completion to the helper (remote)
+    glm tiny-<name>         # future small harness (same pattern as hermes)
+    glm health              # health of every configured endpoint
+    glm ls                  # list configured roles
+
+Local roles (have a `model` path) are served via scripts/colibri-serve.
+Remote roles (have a `base_url`, no `model`) are proxied/queried.
+
+Config: configs/colibri.toml (override with $COLI_CONFIG).
+This CLI does not modify any default configuration.
+"""
+import sys, os, json, subprocess, urllib.request, urllib.error, tomllib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CFG = os.path.join(HERE, "configs", "colibri.toml")
+
+
+def load_cfg():
+    path = os.environ.get("COLI_CONFIG", DEFAULT_CFG)
+    if not os.path.exists(path):
+        sys.exit(f"config not found: {path}")
+    with open(path, "rb") as f:
+        return tomllib.load(f), path
+
+
+def section(cfg, name):
+    return cfg.get(name, {})
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def cmd_health_all(cfg):
+    roles = []
+    if "primary" in cfg:
+        roles.append(("opencode (primary)", cfg["primary"].get("host", "127.0.0.1"),
+                      int(cfg["primary"].get("port", 8000)),
+                      cfg["primary"].get("api_key", "")))
+    for name, sec in cfg.items():
+        if name.startswith("helper") or name.startswith("tiny"):
+            bu = sec.get("base_url")
+            if bu:
+                from urllib.parse import urlparse
+                u = urlparse(bu)
+                roles.append((name, u.hostname or "127.0.0.1", u.port or 8000, sec.get("api_key", "")))
+    for label, host, port, key in roles:
+        url = f"http://{host}:{port}/health"
+        try:
+            req = urllib.request.Request(url)
+            if key:
+                req.add_header("Authorization", f"Bearer {key}")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.load(r)
+                if "kv_slots" not in data and "scheduler" not in data:
+                    eprint(f"  OTHER {label:24} {url}  (not a colibri server: {data.get('service', data.get('status','?'))})")
+                    continue
+                hot = data.get("kv_cache_hot")
+                extra = f" hot={hot['prompts']}prompts/{hot['size_mb']}MB hits={hot['hits']}" if hot else ""
+                eprint(f"  OK   {label:24} {url}  rss={data.get('tiers',{}).get('ram_gb','?')}GB{extra}")
+        except Exception as e:
+            eprint(f"  DOWN {label:24} {url}  ({type(e).__name__}: {e})")
+
+
+def cmd_ls(cfg):
+    eprint("configured roles:")
+    if "primary" in cfg:
+        p = cfg["primary"]
+        eprint(f"  opencode   local GLM-5.2  {p.get('host')}:{p.get('port')}  model={p.get('model_id')}")
+    for name, sec in cfg.items():
+        if name.startswith("helper") or name.startswith("tiny"):
+            if sec.get("base_url"):
+                eprint(f"  {name:10} remote {sec.get('base_url')}  model={sec.get('model_id')}")
+            elif sec.get("model"):
+                eprint(f"  {name:10} local  {sec.get('model_id')}  {sec.get('host')}:{sec.get('port')}")
+
+
+def serve_local(role, sec, cfg):
+    """Launch a local serve role via scripts/colibri-serve, overriding the
+    profile with this role's section when present."""
+    script = os.path.join(HERE, "scripts", "colibri-serve")
+    # Build an ad-hoc config: start from primary, overlay role section.
+    merged = dict(cfg.get("primary", {}))
+    cache = dict(cfg.get("cache", {}))
+    for k, v in sec.items():
+        merged[k] = v
+    # Write a temp config so the existing launcher does the env wiring.
+    import tempfile, io
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, dir=HERE)
+    tmp.write('[primary]\n')
+    for k, v in merged.items():
+        if isinstance(v, bool):
+            tmp.write(f'{k} = {"true" if v else "false"}\n')
+        elif isinstance(v, str):
+            tmp.write(f'{k} = "{v}"\n')
+        else:
+            tmp.write(f'{k} = {v}\n')
+    tmp.write('[cache]\n')
+    for k, v in cache.items():
+        if isinstance(v, bool):
+            tmp.write(f'{k} = {"true" if v else "false"}\n')
+        elif isinstance(v, str):
+            tmp.write(f'{k} = "{v}"\n')
+        else:
+            tmp.write(f'{k} = {v}\n')
+    tmp.close()
+    eprint(f"glm {role}: serving local model (pid parent)")
+    os.execv(script, [script, tmp.name])
+
+
+def proxy_chat(sec, prompt):
+    bu = sec.get("base_url")
+    if not bu:
+        sys.exit("this role has no base_url (it is a local-serve role)")
+    model = sec.get("model_id", "model")
+    key = sec.get("api_key", "")
+    url = bu.rstrip("/") + "/chat/completions"
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
+                       "temperature": 0, "max_tokens": 512}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.load(r)
+            print(data["choices"][0]["message"]["content"])
+    except urllib.error.HTTPError as e:
+        sys.exit(f"chat failed: {e.code} {e.read().decode()[:500]}")
+
+
+def resolve_role(cfg, role):
+    if role == "opencode":
+        if "primary" not in cfg:
+            sys.exit("no [primary] section in config")
+        return "opencode", cfg["primary"], True
+    if role == "hermes":
+        sec = cfg.get("hermes") or cfg.get("helper")
+        if not sec:
+            sys.exit("no [helper] / [hermes] section in config")
+        return "hermes", sec, "model" in sec
+    if role.startswith("tiny-"):
+        name = role[len("tiny-"):]
+        sec = cfg.get(f"tiny.{name}")
+        if not sec:
+            sys.exit(f"no [tiny.{name}] section in config (tiny harness not built yet)")
+        return role, sec, "model" in sec
+    sys.exit(f"unknown role: {role}  (try: opencode, hermes, tiny-<name>)")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        eprint(__doc__)
+        return
+    cmd = args[0]
+    if cmd in ("ls", "list"):
+        _, path = load_cfg();  # reuse
+        cfg, _ = load_cfg()
+        cmd_ls(cfg); return
+    if cmd == "health":
+        cfg, _ = load_cfg(); cmd_health_all(cfg); return
+    if cmd in ("opencode", "hermes") or cmd.startswith("tiny-"):
+        cfg, _ = load_cfg()
+        role, sec, is_local = resolve_role(cfg, cmd)
+        sub = args[1] if len(args) > 1 else None
+        if is_local:
+            if sub in (None, "serve"):
+                serve_local(role, sec, cfg)
+            else:
+                sys.exit(f"role {role} is local; use '{cmd} serve' (default) or no subcommand")
+        else:
+            if sub == "chat":
+                if len(args) < 3:
+                    sys.exit(f"usage: glm {cmd} chat \"your prompt\"")
+                proxy_chat(sec, " ".join(args[2:]))
+            elif sub in (None, "status", "health"):
+                # just print connection info / health
+                bu = sec.get("base_url"); key = sec.get("api_key", "")
+                url = bu.rstrip("/") + "/health"
+                req = urllib.request.Request(url)
+                if key:
+                    req.add_header("Authorization", f"Bearer {key}")
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        eprint(f"{role}: OK {url}\n{json.dumps(json.load(r), indent=2)}")
+                except Exception as e:
+                    eprint(f"{role}: {bu}  ({type(e).__name__}: {e})")
+            else:
+                sys.exit(f"unknown subcommand for {role}: {sub}")
+        return
+    eprint(f"unknown command: {cmd}\n")
+    eprint(__doc__)
+
+
+if __name__ == "__main__":
+    main()
