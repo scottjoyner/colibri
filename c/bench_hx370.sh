@@ -50,7 +50,7 @@ IOMODE="base"
 [ "${PIPE:-0}" = "1" ] && IOMODE="${IOMODE:+$IOMODE+}pipe"
 [ "$IOMODE" = "base" ] && IOMODE="base$([ "${DIRECT:-0}" = "1" ] && echo +direct)"
 
-echo "=== bench $RUN_ID | iomode=$IOMODE ram=$RAM_GB topp=$TOPP n=$N cores=$OMP_NUM_THREADS ==="
+echo "=== bench $RUN_ID | iomode=$IOMODE ram=$RAM_GB topp=$TOPP n=$N cores=$OMP_NUM_THREADS runs=${RUNS} ==="
 echo "    prompt: ${PROMPT:0:48}..."
 
 # SNAP=<model> ./glm <ctx> <batch> <ngen>  -> here batch=1 (decode), ctx small
@@ -66,26 +66,34 @@ export TOPK
 export PIN_IO
 export PROMPT
 
-OUT=$(SNAP="$MODEL" timeout 600 "$GLM" 512 1 "$N" 2>&1)
-RC=$?
+# RUNS>1: the shared SSD (/media/scott/SSD_4TB) is contended by other services,
+# so a single decode number swings wildly. Take the MEDIAN tok/s across runs
+# (and median hit/disk_wait/decode_s) for a stable comparison. The first run
+# also pays warmup (cold expert pages); median is robust to that.
+RUNS=${RUNS:-1}
+DECODES=""; HITS=""; DWS=""; DSS=""; RSSS=""
+for r in $(seq 1 "$RUNS"); do
+  OUT=$(SNAP="$MODEL" timeout 600 "$GLM" 512 1 "$N" 2>&1)
+  RC=$?
+  if [ $RC -ne 0 ]; then echo "RUN $r FAILED (rc=$RC)"; echo "$OUT" | tail -20; continue; fi
+  SUMMARY=$(echo "$OUT" | grep -E 'decode .* tokens in' | tail -1)
+  D=$(echo "$SUMMARY" | grep -oE 'decode [0-9]+ tokens in [0-9.]+s \([0-9.]+ tok/s\)' | grep -oE '[0-9.]+ tok/s' | grep -oE '[0-9.]+')
+  H=$(echo "$SUMMARY" | grep -oE 'expert hit rate [0-9.]+%' | grep -oE '[0-9.]+')
+  DS=$(echo "$SUMMARY" | grep -oE 'decode [0-9]+ tokens in [0-9.]+s' | grep -oE '[0-9.]+s' | grep -oE '[0-9.]+')
+  RW=$(echo "$OUT" | grep -oE 'RSS [0-9.]+ GB' | grep -oE '[0-9.]+' | tail -1)
+  DW=$(echo "$OUT" | grep -E 'PROFILE: expert-disk' | tail -1 | grep -oE 'expert-disk [0-9.]+s service / [0-9.]+s wait' | grep -oE 'service / [0-9.]+s wait' | grep -oE '[0-9.]+s' | tail -1 | grep -oE '[0-9.]+')
+  DECODES="$DECODES ${D:-NA}"; HITS="$HITS ${H:-NA}"; DWS="$DWS ${DW:-NA}"; DSS="$DSS ${DS:-NA}"; RSSS="$RSSS ${RW:-NA}"
+  echo "    run $r: decode=${D:-NA} tok/s hit=${H:-NA}% disk_wait=${DW:-NA}s decode_s=${DS:-NA}s rss=${RW:-NA}GB"
+done
 
-if [ $RC -ne 0 ]; then
-  echo "RUN FAILED (rc=$RC)"; echo "$OUT" | tail -20; exit 1
-fi
-
-# Parse the summary line colibri prints:
-#   "prefill N tokens in Xs | decode N tokens in Xs (X tok/s) | expert hit rate X% | RSS X GB"
-SUMMARY=$(echo "$OUT" | grep -E 'decode .* tokens in' | tail -1)
-DECODE=$(echo "$SUMMARY" | grep -oE 'decode [0-9]+ tokens in [0-9.]+s \([0-9.]+ tok/s\)' | grep -oE '[0-9.]+ tok/s' | grep -oE '[0-9.]+')
-HIT=$(echo "$SUMMARY" | grep -oE 'expert hit rate [0-9.]+%' | grep -oE '[0-9.]+')
-DECODE_S=$(echo "$SUMMARY" | grep -oE 'decode [0-9]+ tokens in [0-9.]+s' | grep -oE '[0-9.]+s' | grep -oE '[0-9.]+')
-RSS=$(echo "$SUMMARY" | grep -oE 'RSS [0-9.]+ GB' | grep -oE '[0-9.]+')
-DISK_WAIT=$(echo "$OUT" | grep -E 'PROFILE: expert-disk' | tail -1 | grep -oE 'expert-disk [0-9.]+s service / [0-9.]+s wait' | grep -oE 'service / [0-9.]+s wait' | grep -oE '[0-9.]+s' | tail -1 | grep -oE '[0-9.]+')
+# median of a whitespace list (drops NA), prints NA if none
+median(){ local v=$(echo "$1" | tr ' ' '\n' | grep -v '^NA$' | grep -v '^$' | sort -n | awk '{a[NR]=$1} END{n=NR; if(n==0){print "NA"} else if(n%2){print a[(n+1)/2]} else {print (a[n/2]+a[n/2+1])/2}}'); echo "${v:-NA}"; }
+DECODE=$(median "$DECODES"); HIT=$(median "$HITS"); DISK_WAIT=$(median "$DWS"); DECODE_S=$(median "$DSS"); RSS=$(median "$RSSS")
 
 DECODE=${DECODE:-NA}; HIT=${HIT:-NA}; DISK_WAIT=${DISK_WAIT:-NA}; DECODE_S=${DECODE_S:-NA}; RSS=${RSS:-NA}
 
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$RUN_ID" "$IOMODE" "$RAM_GB" "$TOPP" "$N" "$OMP_NUM_THREADS" "$DECODE" "$HIT" "$DISK_WAIT" "$DECODE_S" "$RSS" >> "$RESULTS"
 
-echo "    -> decode=${DECODE} tok/s  hit=${HIT}%  disk_wait=${DISK_WAIT}s  decode_s=${DECODE_S}s  rss=${RSS}GB"
+echo "    -> MEDIAN decode=${DECODE} tok/s  hit=${HIT}%  disk_wait=${DISK_WAIT}s  decode_s=${DECODE_S}s  rss=${RSS}GB"
 echo "    saved to $RESULTS"
