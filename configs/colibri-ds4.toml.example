@@ -1,0 +1,23 @@
+# Example: point the colibri fleet at a NeutronStar ds4-server (OpenAI-compatible).
+# ds4-server listens on :8000 by default and serves /v1/chat/completions etc.
+# After building ds4 on the target APU, copy the relevant blocks into colibri.toml
+# (replace the in-tree [primary] that launches glm.c). The glm CLI, proxy,
+# tier-3 harness, `glm doctor`, and COLI_LIVE gate are unchanged.
+#
+# Model aliases ds4-server already knows: glm-5.2-chat, deepseek-chat, zai/glm-5.2-chat.
+
+[primary]
+endpoint = "http://localhost:8000/v1"
+model    = "glm-5.2-chat"
+
+[helper]
+endpoint = "http://localhost:8000/v1"
+model    = "deepseek-chat"
+
+[tiny.coder]
+endpoint = "http://localhost:8000/v1"
+model    = "deepseek-chat"
+
+[harness]
+endpoint = "http://localhost:8000/v1"
+model    = "glm-5.2-chat"
