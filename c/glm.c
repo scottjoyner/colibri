@@ -2102,8 +2102,27 @@ typedef struct {
 } PipePool;
 static PipePool g_pp;
 
+/* PIN_IO: comma/range list of core ids ("8,9,10,11" or "8-11") to bind the
+ * async I/O worker + pilot threads to, so they stop stealing cycles from the
+ * OMP compute threads on core-count-constrained boxes (e.g. 12 Zen5 cores
+ * fighting 12 OMP + 8 I/O workers). Empty/invalid -> no pinning. */
+static void pin_to_cores(const char *spec){
+    if(!spec||!*spec) return;
+    cpu_set_t cs; CPU_ZERO(&cs); int n=0;
+    char buf[64]; strncpy(buf,spec,sizeof buf-1); buf[sizeof buf-1]=0;
+    for(char *p=strtok(buf,","); p; p=strtok(NULL,",")){
+        int a,b;
+        if(strchr(p,'-')){ sscanf(p,"%d-%d",&a,&b); } else { a=b=atoi(p); }
+        if(a<0) a=0; if(b<a) b=a;
+        for(int c=a;c<=b;c++){ CPU_SET(c,&cs); n++; }
+    }
+    if(!n) return;
+    pthread_t self=pthread_self();
+    if(pthread_setaffinity_np(self,sizeof(cs),&cs)) return; /* best-effort */
+}
 static void *pipe_worker(void *arg){
     (void)arg; PipePool *p=&g_pp; uint64_t seen=0;
+    pin_to_cores(getenv("PIN_IO"));
     for(;;){
         pthread_mutex_lock(&p->mx);
         while((atomic_load_explicit(&p->cur,memory_order_relaxed)>>8)==seen)
@@ -3493,6 +3512,7 @@ static void pilot_uring_batch(Model *m){
 #endif
 static void *pilot_worker(void *arg){
     (void)arg;
+    pin_to_cores(getenv("PIN_IO"));
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);

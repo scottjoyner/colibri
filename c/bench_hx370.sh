@@ -22,12 +22,21 @@ TOPP=${TOPP:-0}
 TOPK=${TOPK:-1}
 N=${N:-96}                 # tokens to generate
 MTP=${MTP:-0}              # forced off: MTP is net-negative on this disk-bound box
+# TOPK=4: route to 4 experts/tok instead of 8 (model default). Halves MoE
+# compute AND disk loads; output stays coherent on the water-cycle prompt.
+TOPK=${TOPK:-4}
 PROMPT=${PROMPT:-"The water cycle is the continuous movement of water on, above, and below the surface of the Earth. Explain how it works."}
 
-# core pinning per winning 6x5090 config (12 physical cores; HX370 has 12 cores)
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-12}
+# Core isolation for the HX370 (12 Zen5 physical cores, no SMT win at 24):
+#   - OMP compute on cores 0-7 (8 threads) so the matmul never shares a core
+#     with the async I/O workers
+#   - PIN_IO=8-11 binds the pipe + pilot I/O workers to cores 8-11
+# This ended the compute<->I/O thread thrash that cost ~40% decode throughput
+# when all 20 threads (12 OMP + 8 I/O) fought for the same 12 cores.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export OMP_PROC_BIND=spread
-export OMP_PLACES=cores
+export OMP_PLACES=${OMP_PLACES:-"{0,1,2,3,4,5,6,7}"}
+export PIN_IO=${PIN_IO:-8-11}
 # CPU-only binary: do NOT set COLI_GPUS (the engine treats any value as a CUDA request).
 unset COLI_GPUS 2>/dev/null || true
 
@@ -53,7 +62,8 @@ export NGEN=$N
 export DRAFT=0
 export MTP=$MTP
 export TEMP=0
-export TOPK=1
+export TOPK
+export PIN_IO
 export PROMPT
 
 OUT=$(SNAP="$MODEL" timeout 600 "$GLM" 512 1 "$N" 2>&1)
