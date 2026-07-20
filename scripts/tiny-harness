@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# tiny-harness — skeleton for a small local LM fine-tuned on opencode traces.
+#
+# This is the FUTURE piece: a smaller model (e.g. hermes-helper-finetune) that
+# runs in parallel with the GLM-5.2 primary, handling cheap/high-frequency
+# turns. The serving half is wired; the TRAINING/EVAL half is a TODO.
+#
+# Usage:  scripts/tiny-harness <name> [serve|train|eval]
+#   name   = the [tiny.<name>] section in configs/colibri.toml
+#
+# Config (configs/colibri.toml):
+#   [tiny.myharness]
+#   model   = "/path/to/small-model"   # local -> served via colibri-serve
+#   # OR
+#   base_url = "http://other-device:8100/v1"  # remote -> proxy only
+#   model_id = "myharness"
+#   host = "127.0.0.1"; port = 8300
+#
+# Subcommands:
+#   serve   launch a local OpenAI-compatible server for the small model (coli serve)
+#   train   FINE-TUNE on opencode traces  (TODO — plug your pipeline here)
+#   eval    EVALUATE the harness vs GLM on a held-out trace set  (TODO)
+set -euo pipefail
+
+NAME="${1:-}"; ACTION="${2:-serve}"
+[ -n "$NAME" ] || { echo "usage: tiny-harness <name> [serve|train|eval]" >&2; exit 1; }
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CFG="${COLI_CONFIG:-$HERE/configs/colibri.toml}"
+python3 - "$CFG" "$NAME" "$ACTION" <<'PY'
+import sys, os, json, tomllib, subprocess
+cfg_path, name, action = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = tomllib.load(open(cfg_path,"rb"))
+sec = cfg.get(f"tiny.{name}")
+if not sec:
+    sys.exit(f"no [tiny.{name}] section in {cfg_path}")
+HERE = os.path.dirname(os.path.abspath(__file__))
+if action == "serve":
+    if sec.get("base_url") and not sec.get("model"):
+        print(f"[tiny.{name}] remote endpoint only: {sec['base_url']} (no local serve)")
+        sys.exit(0)
+    model = sec["model"]; port = sec.get("port", 8300)
+    host = sec.get("host", "127.0.0.1"); mid = sec.get("model_id", name)
+    key = sec.get("api_key", "local")
+    # build an ad-hoc primary-style config so colibri-serve wires the tiers
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, dir=HERE)
+    tmp.write('[primary]\n')
+    for k in ("model","host","port","api_key","model_id","ram_gb","ngen","kv_slots","max_queue","queue_timeout"):
+        if k in sec:
+            v = sec[k]
+            tmp.write(f'{k} = {v!r}\n' if isinstance(v,str) else f'{k} = {v}\n')
+    tmp.write('[cache]\n')
+    for k,v in cfg.get("cache",{}).items():
+        tmp.write(f'{k} = {v!r}\n' if isinstance(v,str) else f'{k} = {v}\n')
+    tmp.close()
+    print(f"[tiny.{name}] serving {mid} on {host}:{port}")
+    os.execv(os.path.join(HERE,"scripts","colibri-serve"), [os.path.join(HERE,"scripts","colibri-serve"), tmp.name])
+elif action == "train":
+    # TODO: plug your fine-tune pipeline here. Suggested shape:
+    #   1. collect opencode traces (already on this box)
+    #   2. format as chat_template rows
+    #   3. fine-tune the small base -> sec["model"]
+    #   4. re-run `tiny-harness <name> serve` + `glm proxy` to route to it
+    print(f"[tiny.{name}] TRAIN not implemented yet (TODO).")
+    print(f"  traces: opencode history on this box")
+    print(f"  target model: {sec.get('model')}")
+    print(f"  after training: `glm tiny-{name} serve` then point glm proxy at it")
+    sys.exit(0)
+elif action == "eval":
+    # TODO: score the harness vs GLM on a held-out trace set; emit routing stats
+    print(f"[tiny.{name}] EVAL not implemented yet (TODO).")
+    sys.exit(0)
+else:
+    sys.exit(f"unknown action: {action}  (serve|train|eval)")
+PY

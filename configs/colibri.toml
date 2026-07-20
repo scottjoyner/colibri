@@ -6,6 +6,7 @@
 # through the [helper] endpoints below. opencode fans tasks to GLM vs helper.
 #
 # Edit the values, then launch with:  scripts/colibri-serve configs/colibri.toml
+# or the fleet CLI:  glm opencode | glm hermes | glm proxy | glm tiny-<name>
 
 [primary]
 # GLM-5.2-colibri int4+int8-MTP snapshot (reads from SNAP env inside gli)
@@ -40,17 +41,34 @@ prime_dir = ""
 
 [helper]
 # Smaller fine-tuned LM (trained on opencode traces) running on ANOTHER device.
-# opencode routes cheap/high-frequency turns (classify, route, tool-shaping,
-# scratch) here; GLM-5.2 handles the heavy reasoning/codegen.
-#
-# This node only needs the ENDPOINT to talk to it. Run the helper model with
-# its own `coli serve` (or any OpenAI-compatible server) on the helper device,
-# then point opencode at it via configs/opencode.colibri.jsonc.
-enabled = false
+# opencode / the glm proxy route cheap/high-frequency turns (classify, route,
+# tool-shaping, scratch) here; GLM-5.2 handles the heavy reasoning/codegen.
+enabled = true
 base_url = "http://helper-device.local:8100/v1"
 api_key = "helper-local"
 model_id = "hermes-helper-finetune"
 
-# Token-budget heuristic for the local router (if you enable the coli proxy):
-# tasks estimated under `route_max_tokens` go to the helper, else GLM.
+[proxy]
+# glm proxy: a local OpenAI-compatible front door that auto-routes each request
+# to GLM (primary) or the helper based on an estimated token budget. Point
+# opencode at the proxy port instead of GLM directly to get transparent routing.
+enabled = true
+host = "127.0.0.1"
+port = 8200
+api_key = "local-glm52"
+# Tasks with an estimated token cost at or below this go to the helper; above
+# it, to GLM. Cheap classify/route/format -> helper; long reasoning -> GLM.
 route_max_tokens = 256
+# When routing to the helper, rewrite the model id to the helper's model_id
+# (the helper may not accept "glm-5.2-colibri"). Set false to pass through as-is.
+rewrite_model_id = true
+
+# Example small-model harness (future). Disabled until a [tiny.<name>] model
+# exists locally or a base_url is set. Run: glm tiny-example | tiny-harness example serve
+[tiny.example]
+# model = "/path/to/small-finetune"   # local -> served via colibri-serve
+base_url = "http://helper-device.local:8300/v1"   # remote -> proxy only for now
+model_id = "tiny-example"
+host = "127.0.0.1"
+port = 8300
+api_key = "local"

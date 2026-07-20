@@ -10,6 +10,8 @@ glm opencode           # serve the GLM-5.2 primary locally (via scripts/colibri-
 glm hermes             # show helper endpoint status / connection info
 glm hermes chat "..."  # send a chat completion to the helper (remote)
 glm tiny-<name>        # future small harness — same pattern as hermes
+glm proxy              # local OpenAI-compatible router: GLM <-> helper by token budget
+glm route "<prompt>"   # dry-run: print which backend a request would hit
 ```
 
 ## Roles
@@ -21,7 +23,24 @@ glm tiny-<name>        # future small harness — same pattern as hermes
   proxies a completion.
 - **tiny-`<name>`** → `[tiny.<name>]` section: future small local harnesses
   (e.g. a traced-finetune eval loop). Same local-serve / remote-proxy pattern;
-  add the section when the harness exists.
+  add the section when the harness exists. `scripts/tiny-harness <name>
+  [serve|train|eval]` is the harness skeleton (serve wired; train/eval TODO).
+
+## Proxy (token-budget routing)
+
+`glm proxy` starts a local OpenAI-compatible front door on `[proxy].port`
+(default 8200). Point opencode at it instead of GLM directly to get
+transparent routing:
+
+- Each request's token cost is estimated (~4 chars/token of prompt + requested
+  `max_tokens`).
+- If `estimate <= [proxy].route_max_tokens` → forwarded to the **helper**
+  (cheap classify/route/format/scratch turns).
+- Otherwise → forwarded to **GLM** (heavy reasoning/codegen).
+- Upstream unreachable → clean `502` (no crash). Streaming passes through.
+
+`glm route "your prompt"` prints the decision without serving — useful to
+tune `route_max_tokens`.
 
 ## Config override
 

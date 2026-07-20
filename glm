@@ -7,6 +7,8 @@ Routes by role to the right model/endpoint defined in configs/colibri.toml:
     glm hermes              # show helper endpoint status / connection info
     glm hermes chat "..."   # send a chat completion to the helper (remote)
     glm tiny-<name>         # future small harness (same pattern as hermes)
+    glm proxy               # local OpenAI-compatible router: GLM <-> helper by token budget
+    glm route "<prompt>"    # dry-run: print which backend a request would hit
     glm health              # health of every configured endpoint
     glm ls                  # list configured roles
 
@@ -16,7 +18,8 @@ Remote roles (have a `base_url`, no `model`) are proxied/queried.
 Config: configs/colibri.toml (override with $COLI_CONFIG).
 This CLI does not modify any default configuration.
 """
-import sys, os, json, subprocess, urllib.request, urllib.error, tomllib
+import sys, os, json, subprocess, urllib.request, urllib.error, urllib.parse, tomllib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CFG = os.path.join(HERE, "configs", "colibri.toml")
@@ -59,9 +62,6 @@ def cmd_health_all(cfg):
                 req.add_header("Authorization", f"Bearer {key}")
             with urllib.request.urlopen(req, timeout=5) as r:
                 data = json.load(r)
-                if "kv_slots" not in data and "scheduler" not in data:
-                    eprint(f"  OTHER {label:24} {url}  (not a colibri server: {data.get('service', data.get('status','?'))})")
-                    continue
                 hot = data.get("kv_cache_hot")
                 extra = f" hot={hot['prompts']}prompts/{hot['size_mb']}MB hits={hot['hits']}" if hot else ""
                 eprint(f"  OK   {label:24} {url}  rss={data.get('tiers',{}).get('ram_gb','?')}GB{extra}")
@@ -86,13 +86,11 @@ def serve_local(role, sec, cfg):
     """Launch a local serve role via scripts/colibri-serve, overriding the
     profile with this role's section when present."""
     script = os.path.join(HERE, "scripts", "colibri-serve")
-    # Build an ad-hoc config: start from primary, overlay role section.
     merged = dict(cfg.get("primary", {}))
     cache = dict(cfg.get("cache", {}))
     for k, v in sec.items():
         merged[k] = v
-    # Write a temp config so the existing launcher does the env wiring.
-    import tempfile, io
+    import tempfile
     tmp = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, dir=HERE)
     tmp.write('[primary]\n')
     for k, v in merged.items():
@@ -154,6 +152,118 @@ def resolve_role(cfg, role):
     sys.exit(f"unknown role: {role}  (try: opencode, hermes, tiny-<name>)")
 
 
+def estimate_tokens(body):
+    """Rough token estimate to drive routing (no tokenizer dependency).
+    ~4 chars/token for the prompt text + the requested max_tokens."""
+    msgs = body.get("messages", [])
+    text = " ".join(m.get("content", "") for m in msgs if isinstance(m, dict))
+    n = max(1, len(text) // 4)
+    n += int(body.get("max_tokens", 0) or 0)
+    return n
+
+
+def pick_backend(cfg, body):
+    """Return (label, base_url, api_key, model_id) for the chosen backend."""
+    proxy = cfg.get("proxy", {})
+    thr = int(proxy.get("route_max_tokens", 256))
+    est = estimate_tokens(body)
+    helper = cfg.get("helper") or cfg.get("hermes")
+    primary = cfg.get("primary", {})
+    if helper and helper.get("base_url") and est <= thr:
+        return ("helper", helper["base_url"], helper.get("api_key", ""),
+                helper.get("model_id", "model"))
+    pbase = f"http://{primary.get('host','127.0.0.1')}:{primary.get('port',8000)}/v1"
+    return ("glm", pbase, primary.get("api_key", ""), primary.get("model_id", "model"))
+
+
+def run_proxy(cfg):
+    proxy = cfg.get("proxy", {})
+    host = proxy.get("host", "127.0.0.1")
+    port = int(proxy.get("port", 8200))
+    pkey = proxy.get("api_key", "")
+    rewrite = proxy.get("rewrite_model_id", True)
+    thr = int(proxy.get("route_max_tokens", 256))
+
+    class Handler(BaseHTTPRequestHandler):
+        def _read_body(self):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {}
+
+        def _forward(self, target_url, target_key, target_model):
+            body = self._read_body()
+            if rewrite and target_model:
+                body["model"] = target_model
+            fwd = json.dumps(body).encode()
+            req = urllib.request.Request(target_url, data=fwd,
+                                         headers={"Content-Type": "application/json"})
+            if target_key:
+                req.add_header("Authorization", f"Bearer {target_key}")
+            try:
+                r = urllib.request.urlopen(req, timeout=600)
+            except urllib.error.HTTPError as e:
+                self.send_response(e.code)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(e.read())
+                return
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                # upstream unreachable (helper device down / GLM not started): 502
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": {"message": f"upstream unreachable: {e}",
+                                                         "type": "upstream_unreachable"}}).encode())
+                return
+            self.send_response(r.status if hasattr(r, "status") else 200)
+            ct = r.headers.get("Content-Type", "application/json")
+            self.send_header("Content-Type", ct)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
+        def do_GET(self):
+            if self.path.rstrip("/") in ("/health", "/v1/health"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "role": "proxy",
+                                             "routes": {"glm": "primary", "helper": "helper"},
+                                             "route_max_tokens": thr}).encode())
+                return
+            self.send_response(404); self.end_headers()
+
+        def do_POST(self):
+            if self.path.rstrip("/") in ("/v1/chat/completions", "/chat/completions"):
+                body = self._read_body()
+                label, bu, key, mid = pick_backend(cfg, body)
+                eprint(f"[proxy] -> {label} ({bu})")
+                self._forward(bu.rstrip("/") + "/chat/completions", key, mid)
+                return
+            self.send_response(404); self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    eprint(f"glm proxy: http://{host}:{port}/v1  (route <= {thr} tok -> helper, else GLM)")
+    HTTPServer((host, port), Handler).serve_forever()
+
+
+def cmd_route(cfg, prompt):
+    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 0}
+    label, bu, key, mid = pick_backend(cfg, body)
+    est = estimate_tokens(body)
+    eprint(f"estimate={est} tok  ->  {label}  ({bu})  model={mid}")
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
@@ -161,11 +271,19 @@ def main():
         return
     cmd = args[0]
     if cmd in ("ls", "list"):
-        _, path = load_cfg();  # reuse
-        cfg, _ = load_cfg()
-        cmd_ls(cfg); return
+        cfg, _ = load_cfg(); cmd_ls(cfg); return
     if cmd == "health":
         cfg, _ = load_cfg(); cmd_health_all(cfg); return
+    if cmd == "route":
+        cfg, _ = load_cfg()
+        if len(args) < 2:
+            sys.exit("usage: glm route \"your prompt\"")
+        cmd_route(cfg, " ".join(args[1:])); return
+    if cmd == "proxy":
+        cfg, _ = load_cfg()
+        if not cfg.get("proxy", {}).get("enabled", True):
+            sys.exit("proxy disabled in config ([proxy].enabled=false)")
+        run_proxy(cfg); return
     if cmd in ("opencode", "hermes") or cmd.startswith("tiny-"):
         cfg, _ = load_cfg()
         role, sec, is_local = resolve_role(cfg, cmd)
@@ -181,7 +299,6 @@ def main():
                     sys.exit(f"usage: glm {cmd} chat \"your prompt\"")
                 proxy_chat(sec, " ".join(args[2:]))
             elif sub in (None, "status", "health"):
-                # just print connection info / health
                 bu = sec.get("base_url"); key = sec.get("api_key", "")
                 url = bu.rstrip("/") + "/health"
                 req = urllib.request.Request(url)
