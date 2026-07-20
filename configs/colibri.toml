@@ -72,3 +72,25 @@ model_id = "tiny-example"
 host = "127.0.0.1"
 port = 8300
 api_key = "local"
+
+# Hermes adapter: how Hermes-agent should talk to our helper endpoint.
+# Hermes speaks OpenAI-compatible via provider:"custom" + base_url. `glm hermes
+# config` emits the [model] block to drop into Hermes' cli-config.yaml (or
+# ~/.hermes/cli-config.yaml) so Hermes routes through the helper.
+[hermes]
+helper = "hermes-helper-finetune"   # the [helper] model_id Hermes should request
+# adapter block reused by `glm hermes config`:
+adapter_base_url = "http://helper-device.local:8100/v1"
+adapter_api_key = "helper-local"
+
+# Tier-3 self-contained harness: a small orchestrator LM that fans out subtasks
+# to subagents (each a tiny.<name> endpoint). `glm harness` runs the loop.
+[harness]
+enabled = true
+# orchestrator endpoint (a small LM; can be the helper or a dedicated one)
+base_url = "http://helper-device.local:8100/v1"
+api_key = "helper-local"
+model_id = "harness-orchestrator"
+# subagents fanned out in parallel (each must have a [tiny.<name>] section)
+subagents = ["example"]
+max_subtasks = 8

@@ -4,9 +4,12 @@
 Routes by role to the right model/endpoint defined in configs/colibri.toml:
 
     glm opencode            # serve the GLM-5.2 primary (heavy hitter) locally
-    glm hermes              # show helper endpoint status / connection info
+    glm hermes              # helper endpoint status
+    glm hermes config       # emit the Hermes cli-config.yaml [model] block
+    glm hermes check        # verify the hermes-adapter helper endpoint responds
     glm hermes chat "..."   # send a chat completion to the helper (remote)
     glm tiny-<name>         # future small harness (same pattern as hermes)
+    glm harness [task]      # tier-3 orchestrator: fan subtasks out to subagents
     glm proxy               # local OpenAI-compatible router: GLM <-> helper by token budget
     glm route "<prompt>"    # dry-run: print which backend a request would hit
     glm health              # health of every configured endpoint
@@ -20,6 +23,7 @@ This CLI does not modify any default configuration.
 """
 import sys, os, json, subprocess, urllib.request, urllib.error, urllib.parse, tomllib
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CFG = os.path.join(HERE, "configs", "colibri.toml")
@@ -33,10 +37,6 @@ def load_cfg():
         return tomllib.load(f), path
 
 
-def section(cfg, name):
-    return cfg.get(name, {})
-
-
 def eprint(*a):
     print(*a, file=sys.stderr)
 
@@ -48,7 +48,7 @@ def cmd_health_all(cfg):
                       int(cfg["primary"].get("port", 8000)),
                       cfg["primary"].get("api_key", "")))
     for name, sec in cfg.items():
-        if name.startswith("helper") or name.startswith("tiny"):
+        if name.startswith("helper") or name.startswith("tiny") or name == "hermes":
             bu = sec.get("base_url")
             if bu:
                 from urllib.parse import urlparse
@@ -75,7 +75,7 @@ def cmd_ls(cfg):
         p = cfg["primary"]
         eprint(f"  opencode   local GLM-5.2  {p.get('host')}:{p.get('port')}  model={p.get('model_id')}")
     for name, sec in cfg.items():
-        if name.startswith("helper") or name.startswith("tiny"):
+        if name.startswith("helper") or name.startswith("tiny") or name == "hermes":
             if sec.get("base_url"):
                 eprint(f"  {name:10} remote {sec.get('base_url')}  model={sec.get('model_id')}")
             elif sec.get("model"):
@@ -133,6 +133,18 @@ def proxy_chat(sec, prompt):
         sys.exit(f"chat failed: {e.code} {e.read().decode()[:500]}")
 
 
+def chat_completion(base_url, api_key, model, messages, timeout=120):
+    """Minimal OpenAI chat completion; returns the assistant text (no streaming)."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    body = json.dumps({"model": model, "messages": messages, "temperature": 0,
+                       "max_tokens": 1024}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)["choices"][0]["message"]["content"]
+
+
 def resolve_role(cfg, role):
     if role == "opencode":
         if "primary" not in cfg:
@@ -153,8 +165,7 @@ def resolve_role(cfg, role):
 
 
 def estimate_tokens(body):
-    """Rough token estimate to drive routing (no tokenizer dependency).
-    ~4 chars/token for the prompt text + the requested max_tokens."""
+    """Rough token estimate to drive routing (no tokenizer dependency)."""
     msgs = body.get("messages", [])
     text = " ".join(m.get("content", "") for m in msgs if isinstance(m, dict))
     n = max(1, len(text) // 4)
@@ -163,7 +174,6 @@ def estimate_tokens(body):
 
 
 def pick_backend(cfg, body):
-    """Return (label, base_url, api_key, model_id) for the chosen backend."""
     proxy = cfg.get("proxy", {})
     thr = int(proxy.get("route_max_tokens", 256))
     est = estimate_tokens(body)
@@ -180,7 +190,6 @@ def run_proxy(cfg):
     proxy = cfg.get("proxy", {})
     host = proxy.get("host", "127.0.0.1")
     port = int(proxy.get("port", 8200))
-    pkey = proxy.get("api_key", "")
     rewrite = proxy.get("rewrite_model_id", True)
     thr = int(proxy.get("route_max_tokens", 256))
 
@@ -211,7 +220,6 @@ def run_proxy(cfg):
                 self.wfile.write(e.read())
                 return
             except (urllib.error.URLError, ConnectionError, OSError) as e:
-                # upstream unreachable (helper device down / GLM not started): 502
                 self.send_response(502)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -264,6 +272,115 @@ def cmd_route(cfg, prompt):
     eprint(f"estimate={est} tok  ->  {label}  ({bu})  model={mid}")
 
 
+def hermes_config(cfg):
+    """Emit the Hermes cli-config.yaml [model] block so Hermes routes through
+    the helper endpoint (OpenAI-compatible via provider:\"custom\")."""
+    h = cfg.get("hermes", {})
+    bu = h.get("adapter_base_url") or (cfg.get("helper", {}) or {}).get("base_url")
+    key = h.get("adapter_api_key") or (cfg.get("helper", {}) or {}).get("api_key", "")
+    model = h.get("helper") or (cfg.get("helper", {}) or {}).get("model_id", "model")
+    if not bu:
+        sys.exit("no hermes.adapter_base_url / helper.base_url in config")
+    block = (
+        "# generated by: glm hermes config  (drop into cli-config.yaml or ~/.hermes/cli-config.yaml)\n"
+        "model:\n"
+        f"  default: \"{model}\"\n"
+        "  provider: \"custom\"\n"
+        f"  base_url: \"{bu}\"\n"
+        f"  api_key: \"{key}\"\n"
+    )
+    print(block)
+
+
+def hermes_check(cfg):
+    h = cfg.get("hermes", {}) or cfg.get("helper", {})
+    bu = h.get("adapter_base_url") or h.get("base_url")
+    key = h.get("adapter_api_key") or h.get("api_key", "")
+    if not bu:
+        sys.exit("no hermes/helper base_url in config")
+    url = bu.rstrip("/") + "/health"
+    req = urllib.request.Request(url)
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.load(r)
+            eprint(f"hermes-adapter OK: {url}\n{json.dumps(data, indent=2)}")
+    except Exception as e:
+        eprint(f"hermes-adapter: {bu}  ({type(e).__name__}: {e})")
+
+
+def run_harness(cfg, task):
+    """Tier-3 orchestrator: a small LM plans subtasks, each is fanned out to a
+    subagent (tiny.<name>) endpoint in parallel, results are collected and the
+    orchestrator synthesizes a final answer.
+
+    This is the skeleton: the orchestrator prompt + subtask parsing are TODO
+    and should match whatever the harness-orchestrator model expects.
+    """
+    h = cfg.get("harness", {})
+    if not h.get("enabled", True):
+        sys.exit("harness disabled in config ([harness].enabled=false)")
+    obu = h.get("base_url"); okey = h.get("api_key", ""); omodel = h.get("model_id", "model")
+    subs = h.get("subagents", [])
+    max_sub = int(h.get("max_subtasks", 8))
+    if not task or task == "-":
+        task = sys.stdin.read().strip()
+    if not task:
+        sys.exit("usage: glm harness \"<task>\"  (or pipe task via stdin)")
+
+    eprint(f"[harness] task: {task[:80]}...")
+    # 1) orchestrator plans subtasks as a JSON list of {"subagent":<name>,"task":<text>}
+    plan_prompt = [
+        {"role": "system", "content": "You are an orchestrator. Decompose the user task into "
+         "independent subtasks. Reply ONLY with a JSON array: "
+         "[{\"subagent\": <name>, \"task\": <text>}, ...]. Valid subagent names: "
+         + ", ".join(subs) + ". If the task is atomic, return a single-element array."},
+        {"role": "user", "content": task},
+    ]
+    try:
+        plan_text = chat_completion(obu, okey, omodel, plan_prompt)
+    except Exception as e:
+        sys.exit(f"[harness] orchestrator unreachable: {e}")
+    # 2) parse the plan (best-effort: extract the first JSON array)
+    import re
+    m = re.search(r"\[.*\]", plan_text, re.DOTALL)
+    try:
+        plan = json.loads(m.group(0)) if m else [{"subagent": subs[0] if subs else "example", "task": task}]
+    except Exception:
+        plan = [{"subagent": subs[0] if subs else "example", "task": task}]
+    plan = plan[:max_sub]
+    eprint(f"[harness] plan: {len(plan)} subtask(s)")
+
+    # 3) fan out each subtask to its subagent (tiny.<name>) endpoint in parallel
+    def run_sub(sub):
+        name = sub.get("subagent", subs[0] if subs else "example")
+        stext = sub.get("task", task)
+        sec = cfg.get(f"tiny.{name}")
+        if not sec or not sec.get("base_url"):
+            return name, f"[no [tiny.{name}] endpoint configured]"
+        try:
+            res = chat_completion(sec["base_url"], sec.get("api_key", ""),
+                                   sec.get("model_id", name),
+                                   [{"role": "user", "content": stext}])
+            return name, res
+        except Exception as e:
+            return name, f"[subagent {name} error: {e}]"
+
+    with ThreadPoolExecutor(max_workers=max_sub) as ex:
+        results = list(ex.map(run_sub, plan))
+
+    # 4) orchestrator synthesizes the final answer from the subtask results
+    synth_msgs = [{"role": "system", "content": "Synthesize a final answer from the subtask "
+                  "results below."},
+                  {"role": "user", "content": "\n\n".join(f"[{n}]\n{r}" for n, r in results)}]
+    try:
+        final = chat_completion(obu, okey, omodel, synth_msgs)
+    except Exception as e:
+        final = "\n\n".join(f"[{n}]\n{r}" for n, r in results)  # fallback: raw concat
+    print(final)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
@@ -284,6 +401,37 @@ def main():
         if not cfg.get("proxy", {}).get("enabled", True):
             sys.exit("proxy disabled in config ([proxy].enabled=false)")
         run_proxy(cfg); return
+    if cmd == "hermes":
+        cfg, _ = load_cfg()
+        sub = args[1] if len(args) > 1 else None
+        if sub == "config":
+            hermes_config(cfg); return
+        if sub == "check":
+            hermes_check(cfg); return
+        # default: status; or chat
+        if sub == "chat":
+            if len(args) < 3:
+                sys.exit("usage: glm hermes chat \"your prompt\"")
+            _, sec, _ = resolve_role(cfg, "hermes")
+            proxy_chat(sec, " ".join(args[2:])); return
+        _, sec, is_local = resolve_role(cfg, "hermes")
+        if is_local:
+            sys.exit("hermes role is remote; use 'glm hermes config|check|chat'")
+        bu = sec.get("base_url"); key = sec.get("api_key", "")
+        url = bu.rstrip("/") + "/health"
+        req = urllib.request.Request(url)
+        if key:
+            req.add_header("Authorization", f"Bearer {key}")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                eprint(f"hermes: OK {url}\n{json.dumps(json.load(r), indent=2)}")
+        except Exception as e:
+            eprint(f"hermes: {bu}  ({type(e).__name__}: {e})")
+        return
+    if cmd == "harness":
+        cfg, _ = load_cfg()
+        task = args[1] if len(args) > 1 else None
+        run_harness(cfg, task); return
     if cmd in ("opencode", "hermes") or cmd.startswith("tiny-"):
         cfg, _ = load_cfg()
         role, sec, is_local = resolve_role(cfg, cmd)

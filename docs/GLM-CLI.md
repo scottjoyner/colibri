@@ -4,27 +4,46 @@
 `configs/colibri.toml`. It does not modify any default configuration.
 
 ```bash
-glm ls                 # list configured roles (opencode, hermes, tiny-*)
+glm ls                 # list configured roles (opencode, hermes, tiny-*, harness)
 glm health             # health of every configured endpoint (colibri-aware)
 glm opencode           # serve the GLM-5.2 primary locally (via scripts/colibri-serve)
-glm hermes             # show helper endpoint status / connection info
+glm hermes config      # emit the Hermes cli-config.yaml [model] block
+glm hermes check       # verify the hermes-adapter helper endpoint responds
 glm hermes chat "..."  # send a chat completion to the helper (remote)
 glm tiny-<name>        # future small harness — same pattern as hermes
+glm harness "<task>"   # tier-3 orchestrator: fan subtasks out to subagents
 glm proxy              # local OpenAI-compatible router: GLM <-> helper by token budget
 glm route "<prompt>"   # dry-run: print which backend a request would hit
 ```
+
+## Three tiers
+
+- **Tier 1 — GLM-5.2 (primary)** `[primary]`: heavy reasoning/codegen on this
+  box, with HOT RAM + SSD KV tiers. `glm opencode` serves it.
+- **Tier 2 — hermes-adapter (helper)** `[helper]`/`[hermes]`: the smaller
+  fine-tuned LM on another device. Hermes-agent speaks OpenAI-compatible via
+  `provider:"custom"` + `base_url`; `glm hermes config` emits the exact
+  `cli-config.yaml` `[model]` block to drop into Hermes so it routes through
+  the helper. `glm hermes check` verifies the endpoint.
+- **Tier 3 — self-contained harness** `[harness]` + `[tiny.<name>]`: a small
+  orchestrator LM that decomposes a task into subtasks and fans them out to
+  subagents (each a `tiny.<name>` endpoint) in parallel, then synthesizes.
+  `glm harness "<task>"` runs the loop. `scripts/tiny-harness <name>
+  [serve|train|eval]` is the per-subagent skeleton.
 
 ## Roles
 
 - **opencode** → `[primary]` section: local GLM-5.2, served via
   `scripts/colibri-serve` with the HOT RAM + SSD KV tiers wired in.
-- **hermes** → `[helper]` section (or `[hermes]`): the smaller fine-tuned LM on
+- **hermes** → `[hermes]` (or `[helper]`): the smaller fine-tuned LM on
   another device. `glm hermes` queries/health-checks it; `glm hermes chat`
-  proxies a completion.
+  proxies a completion; `glm hermes config` writes the Hermes adapter block.
 - **tiny-`<name>`** → `[tiny.<name>]` section: future small local harnesses
   (e.g. a traced-finetune eval loop). Same local-serve / remote-proxy pattern;
   add the section when the harness exists. `scripts/tiny-harness <name>
   [serve|train|eval]` is the harness skeleton (serve wired; train/eval TODO).
+- **harness** → `[harness]` section: orchestrator endpoint + subagent list.
+  `glm harness` runs plan → parallel fan-out → synthesize.
 
 ## Proxy (token-budget routing)
 
