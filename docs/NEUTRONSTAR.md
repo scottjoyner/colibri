@@ -35,6 +35,10 @@ per token; `ds4-server` is the OpenAI-compatible frontend (`:8000`).
 
 ## Next
 1. Let NAS downloads finish (DeepSeek is the slow one).
-2. Install ROCm 7.0 + kernel (other machine first, then mirror here).
+2. Follow the full procedural runbook in the neutronstar repo:
+   `~/git/neutronstar/docs/RUNBOOK.md` — staging verify → ROCm install (reboot)
+   → build → run ds4-server → repoint this fleet → benchmark → KV HOT-RAM port.
+   Every phase has a verify step and explicit [HUMAN] checkpoints.
 3. Build + bench; compare HX 370 vs Strix Halo.
-4. Wire ds4-server into colibri config; then KV port.
+4. Wire ds4-server into colibri config (see `configs/colibri-ds4.toml.example`);
+   then KV port.
