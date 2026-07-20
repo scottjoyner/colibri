@@ -7,6 +7,12 @@
 #
 # Edit the values, then launch with:  scripts/colibri-serve configs/colibri.toml
 # or the fleet CLI:  glm opencode | glm hermes | glm proxy | glm tiny-<name>
+#
+# !! PRE-PRODUCTION / DISARMED BY DEFAULT !!
+# Live actions (serve a model, run the proxy, fan out via the harness, send chat
+# traffic, fine-tune) will NOT run until you explicitly arm the fleet:
+#     export COLI_LIVE=1
+# Run `glm doctor` first to validate the config end-to-end. See docs/FLEET-STATUS.md.
 
 [primary]
 # GLM-5.2-colibri int4+int8-MTP snapshot (reads from SNAP env inside gli)
@@ -62,6 +68,11 @@ route_max_tokens = 256
 # When routing to the helper, rewrite the model id to the helper's model_id
 # (the helper may not accept "glm-5.2-colibri"). Set false to pass through as-is.
 rewrite_model_id = true
+# Hardening: cap request body size (rejects > N bytes with 413) and trip a
+# circuit breaker returning 503 after N consecutive upstream failures.
+max_body_bytes = 8388608          # 8 MiB
+breaker_failures = 5              # open circuit after this many failures
+breaker_cooldown_s = 30           # keep it open this long before retrying
 
 # Example small-model harness. `tiny-example` is proxy-only for now (remote);
 # `tiny.coder` is a LOCAL, trainable example that drives the auto-finetune

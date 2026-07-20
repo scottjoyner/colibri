@@ -41,6 +41,129 @@ def eprint(*a):
     print(*a, file=sys.stderr)
 
 
+# ── Fleet arming gate ───────────────────────────────────────────────────────
+# The fleet's live actions (serve a 744B engine, run the proxy, fan out via the
+# harness, send chat traffic, fine-tune) are DISARMED by default so nothing binds
+# a port or launches a model until the operator explicitly arms it. Set
+# COLI_LIVE=1 in the shell only when models/endpoints are verified ready.
+def require_armed(action):
+    if os.environ.get("COLI_LIVE") != "1":
+        eprint(f"DISARMED: '{action}' is a live action and will not run.")
+        eprint("  Arm the fleet only when models/endpoints are verified ready:")
+        eprint("    export COLI_LIVE=1   # then re-run this command")
+        sys.exit(2)
+
+
+def _port_in_use(host, port, timeout=0.3):
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _endpoint_up(url, key="", timeout=4):
+    req = urllib.request.Request(url)
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            ct = r.headers.get("Content-Type", "")
+            return True, (json.load(r) if ct.startswith("application/json") else None)
+    except Exception:
+        return False, None
+
+
+def cmd_doctor(cfg):
+    """Pre-flight validator: read-only checks that the fleet is safe to arm.
+
+    Reports PASS/WARN/FAIL for config completeness, port collisions/availability,
+    local model paths, remote endpoint reachability, and per-subagent training
+    prerequisites. No live actions are taken.
+    """
+    rows = []  # (level, area, detail)
+    def add(level, area, detail=""):
+        rows.append((level, area, detail))
+
+    for sec in ("primary", "proxy", "helper", "hermes", "harness"):
+        if cfg.get(sec):
+            add("PASS", f"config[{sec}]", "present")
+        else:
+            add("WARN", f"config[{sec}]", "missing (some tiers disabled)")
+
+    ports = {}
+    def reg(port, who):
+        if port is None:
+            return
+        ports.setdefault(int(port), []).append(who)
+    reg(cfg.get("primary", {}).get("port", 8000), "primary")
+    reg(cfg.get("proxy", {}).get("port", 8200), "proxy")
+    for nm, s in (cfg.get("tiny", {}) or {}).items():
+        reg(s.get("port", 8300), f"tiny.{nm}")
+    for port, who in sorted(ports.items()):
+        if len(who) > 1:
+            add("FAIL", f"port {port}", f"collision: {', '.join(who)}")
+        elif _port_in_use("127.0.0.1", port):
+            add("WARN", f"port {port}", f"already in use ({who[0]})")
+        else:
+            add("PASS", f"port {port}", f"free ({who[0]})")
+
+    prim = cfg.get("primary", {})
+    if prim.get("model"):
+        add("PASS" if os.path.exists(prim["model"]) else "FAIL",
+            "primary.model", prim["model"])
+    else:
+        add("WARN", "primary.model", "no local model path (remote?)")
+
+    for sec in ("helper", "hermes"):
+        s = cfg.get(sec)
+        if not s:
+            continue
+        bu = s.get("base_url") or s.get("adapter_base_url")
+        if not bu:
+            add("WARN", f"{sec}.base_url", "missing")
+            continue
+        up, _ = _endpoint_up(bu.rstrip("/") + "/health", s.get("api_key", ""))
+        add("PASS" if up else "WARN", f"{sec}.endpoint",
+            bu + (" reachable" if up else " NOT reachable (will fail at runtime)"))
+
+    for nm, s in (cfg.get("tiny", {}) or {}).items():
+        if s.get("model"):
+            add("PASS" if os.path.exists(s["model"]) else "FAIL",
+                f"tiny.{nm}.model", s["model"])
+        tr = s.get("train_repo")
+        if tr:
+            ok = os.path.isdir(os.path.join(tr, "src"))
+            add("PASS" if ok else "FAIL", f"tiny.{nm}.train_repo",
+                tr + ("" if ok else " (no src/ — pipeline missing)"))
+        tb = s.get("train_base") or s.get("model")
+        if tb and not os.path.exists(tb):
+            add("FAIL", f"tiny.{nm}.train_base", f"not found: {tb}")
+        out = s.get("train_output")
+        if out:
+            parent = os.path.dirname(out) or "."
+            add("PASS" if os.access(parent, os.W_OK) else "FAIL",
+                f"tiny.{nm}.train_output", f"parent writable: {parent}")
+        src = s.get("train_source")
+        if src not in (None, "opencode", "hermes"):
+            add("FAIL", f"tiny.{nm}.train_source", f"invalid: {src}")
+
+    order = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    rows.sort(key=lambda r: (order[r[0]], r[1]))
+    fails = sum(1 for r in rows if r[0] == "FAIL")
+    warns = sum(1 for r in rows if r[0] == "WARN")
+    eprint("glm doctor — fleet pre-flight (read-only):")
+    for lvl, area, detail in rows:
+        eprint(f"  [{lvl}] {area}" + (f" — {detail}" if detail else ""))
+    eprint("")
+    eprint(f"doctor: {len(rows) - fails - warns} pass, {warns} warn, {fails} fail")
+    if fails:
+        eprint("  Resolve FAIL items before arming (export COLI_LIVE=1).")
+    else:
+        eprint("  No fatal issues. Fleet may be armed when ready (still DISARMED by default).")
+
+
 def cmd_health_all(cfg):
     roles = []
     if "primary" in cfg:
@@ -192,20 +315,39 @@ def run_proxy(cfg):
     port = int(proxy.get("port", 8200))
     rewrite = proxy.get("rewrite_model_id", True)
     thr = int(proxy.get("route_max_tokens", 256))
+    # Hardening: reject oversized request bodies, and trip a circuit breaker
+    # (return 503) after repeated upstream failures so a dead backend can't
+    # hang every request for 600s.
+    max_body = int(proxy.get("max_body_bytes", 8 * 1024 * 1024))
+    br_fail = int(proxy.get("breaker_failures", 5))
+    br_cooldown = int(proxy.get("breaker_cooldown_s", 30))
+    import time as _time
+    breaker = {}  # target_url -> {"fails": int, "open_until": float}
 
     class Handler(BaseHTTPRequestHandler):
         def _read_body(self):
-            length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(length) if length else b"{}"
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > max_body:
+                return {"__too_large__": length}
+            raw = self.rfile.read(min(length, max_body)) if length else b"{}"
             try:
                 return json.loads(raw)
             except Exception:
                 return {}
 
-        def _forward(self, target_url, target_key, target_model):
-            body = self._read_body()
+        def _forward(self, target_url, target_key, target_model, body):
             if rewrite and target_model:
                 body["model"] = target_model
+            now = _time.monotonic()
+            st = breaker.get(target_url)
+            if st and st["open_until"] > now:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": {"message": "circuit open for upstream",
+                                                         "type": "circuit_open",
+                                                         "retry_after_s": int(st["open_until"] - now)}}).encode())
+                return
             fwd = json.dumps(body).encode()
             req = urllib.request.Request(target_url, data=fwd,
                                          headers={"Content-Type": "application/json"})
@@ -220,12 +362,19 @@ def run_proxy(cfg):
                 self.wfile.write(e.read())
                 return
             except (urllib.error.URLError, ConnectionError, OSError) as e:
+                b = breaker.setdefault(target_url, {"fails": 0, "open_until": 0.0})
+                b["fails"] += 1
+                if b["fails"] >= br_fail:
+                    b["open_until"] = now + br_cooldown
+                    eprint(f"[proxy] circuit OPEN for {target_url} ({b['fails']} failures)")
                 self.send_response(502)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": {"message": f"upstream unreachable: {e}",
                                                          "type": "upstream_unreachable"}}).encode())
                 return
+            if target_url in breaker:
+                breaker[target_url] = {"fails": 0, "open_until": 0.0}
             self.send_response(r.status if hasattr(r, "status") else 200)
             ct = r.headers.get("Content-Type", "application/json")
             self.send_header("Content-Type", ct)
@@ -252,9 +401,16 @@ def run_proxy(cfg):
         def do_POST(self):
             if self.path.rstrip("/") in ("/v1/chat/completions", "/chat/completions"):
                 body = self._read_body()
+                if "__too_large__" in body:
+                    self.send_response(413)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": {"message": f"request too large ({body['__too_large__']} bytes)",
+                                                             "type": "payload_too_large"}}).encode())
+                    return
                 label, bu, key, mid = pick_backend(cfg, body)
                 eprint(f"[proxy] -> {label} ({bu})")
-                self._forward(bu.rstrip("/") + "/chat/completions", key, mid)
+                self._forward(bu.rstrip("/") + "/chat/completions", key, mid, body)
                 return
             self.send_response(404); self.end_headers()
 
@@ -262,6 +418,7 @@ def run_proxy(cfg):
             pass
 
     eprint(f"glm proxy: http://{host}:{port}/v1  (route <= {thr} tok -> helper, else GLM)")
+    eprint(f"glm proxy: max_body={max_body}B  breaker={br_fail} fails/{br_cooldown}s")
     HTTPServer((host, port), Handler).serve_forever()
 
 
@@ -272,9 +429,15 @@ def cmd_route(cfg, prompt):
     eprint(f"estimate={est} tok  ->  {label}  ({bu})  model={mid}")
 
 
-def hermes_config(cfg):
-    """Emit the Hermes cli-config.yaml [model] block so Hermes routes through
-    the helper endpoint (OpenAI-compatible via provider:\"custom\")."""
+def hermes_config(cfg, extra=None):
+    """Emit (or --apply) the Hermes cli-config.yaml [model] block so Hermes
+    routes through the helper endpoint (OpenAI-compatible via provider:\"custom\").
+
+    By default prints to stdout with the api_key REDACTED. Use --show-key to
+    reveal it, --apply to write the file (with a .bak backup), --out=PATH to
+    choose the destination (default ~/.hermes/cli-config.yaml).
+    """
+    extra = extra or []
     h = cfg.get("hermes", {})
     bu = h.get("adapter_base_url") or (cfg.get("helper", {}) or {}).get("base_url")
     key = h.get("adapter_api_key") or (cfg.get("helper", {}) or {}).get("api_key", "")
@@ -289,25 +452,63 @@ def hermes_config(cfg):
         f"  base_url: \"{bu}\"\n"
         f"  api_key: \"{key}\"\n"
     )
+    show_key = "--show-key" in extra
+    if not show_key:
+        block = block.replace(f'api_key: "{key}"', 'api_key: "<redacted; pass --show-key>"')
+    if "--apply" in extra:
+        out = os.path.expanduser("~/.hermes/cli-config.yaml")
+        for a in extra:
+            if a.startswith("--out="):
+                out = os.path.expanduser(a.split("=", 1)[1])
+        bak = out + ".bak"
+        if os.path.exists(out):
+            import shutil
+            shutil.copy2(out, bak)
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w") as f:
+            f.write(block)
+        eprint(f"wrote {out} (backup: {bak})")
     print(block)
 
 
-def hermes_check(cfg):
+def hermes_check(cfg, extra=None):
+    """Verify the hermes-adapter helper endpoint: /health up AND the configured
+    model_id is actually advertised by its /v1/models (when available)."""
+    extra = extra or []
     h = cfg.get("hermes", {}) or cfg.get("helper", {})
     bu = h.get("adapter_base_url") or h.get("base_url")
     key = h.get("adapter_api_key") or h.get("api_key", "")
+    model = h.get("helper") or h.get("model_id", "model")
     if not bu:
         sys.exit("no hermes/helper base_url in config")
-    url = bu.rstrip("/") + "/health"
-    req = urllib.request.Request(url)
+    hurl = bu.rstrip("/") + "/health"
+    req = urllib.request.Request(hurl)
     if key:
         req.add_header("Authorization", f"Bearer {key}")
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.load(r)
-            eprint(f"hermes-adapter OK: {url}\n{json.dumps(data, indent=2)}")
+            eprint(f"hermes-adapter OK: {hurl}\n{json.dumps(data, indent=2)}")
     except Exception as e:
         eprint(f"hermes-adapter: {bu}  ({type(e).__name__}: {e})")
+        return
+    # model_id advertised?
+    murl = bu.rstrip("/") + "/v1/models"
+    req = urllib.request.Request(murl)
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            mdata = json.load(r)
+        ids = [m.get("id") for m in mdata.get("data", [])]
+        if model in ids:
+            eprint(f"[PASS] model_id '{model}' advertised by {murl}")
+        elif ids:
+            eprint(f"[WARN] model_id '{model}' NOT in {murl} (got: {ids[:8]})")
+        else:
+            eprint(f"[WARN] {murl} returned no model list")
+    except Exception as e:
+        eprint(f"[WARN] {murl} unavailable ({type(e).__name__}); cannot verify model_id")
 
 
 def run_harness(cfg, task):
@@ -389,6 +590,17 @@ def main():
     cmd = args[0]
     if cmd in ("ls", "list"):
         cfg, _ = load_cfg(); cmd_ls(cfg); return
+    if cmd == "doctor":
+        cfg, _ = load_cfg(); cmd_doctor(cfg); return
+    if cmd == "arm":
+        eprint("To arm the fleet for LIVE actions (serve/proxy/harness/train), run in your shell:")
+        eprint("    export COLI_LIVE=1")
+        eprint("It is DISARMED by default; glm will refuse live actions until set.")
+        return
+    if cmd == "disarm":
+        eprint("To disarm the fleet, run in your shell:")
+        eprint("    unset COLI_LIVE")
+        return
     if cmd == "health":
         cfg, _ = load_cfg(); cmd_health_all(cfg); return
     if cmd == "route":
@@ -400,18 +612,20 @@ def main():
         cfg, _ = load_cfg()
         if not cfg.get("proxy", {}).get("enabled", True):
             sys.exit("proxy disabled in config ([proxy].enabled=false)")
+        require_armed("glm proxy")
         run_proxy(cfg); return
     if cmd == "hermes":
         cfg, _ = load_cfg()
         sub = args[1] if len(args) > 1 else None
         if sub == "config":
-            hermes_config(cfg); return
+            hermes_config(cfg, args[2:]); return
         if sub == "check":
-            hermes_check(cfg); return
+            hermes_check(cfg, args[2:]); return
         # default: status; or chat
         if sub == "chat":
             if len(args) < 3:
                 sys.exit("usage: glm hermes chat \"your prompt\"")
+            require_armed("glm hermes chat")
             _, sec, _ = resolve_role(cfg, "hermes")
             proxy_chat(sec, " ".join(args[2:])); return
         _, sec, is_local = resolve_role(cfg, "hermes")
@@ -430,6 +644,7 @@ def main():
         return
     if cmd == "harness":
         cfg, _ = load_cfg()
+        require_armed("glm harness")
         task = args[1] if len(args) > 1 else None
         run_harness(cfg, task); return
     if cmd in ("opencode", "hermes") or cmd.startswith("tiny-"):
@@ -438,6 +653,7 @@ def main():
         sub = args[1] if len(args) > 1 else None
         if is_local:
             if sub in (None, "serve"):
+                require_armed(f"glm {cmd} serve")
                 serve_local(role, sec, cfg)
             else:
                 sys.exit(f"role {role} is local; use '{cmd} serve' (default) or no subcommand")
@@ -445,6 +661,7 @@ def main():
             if sub == "chat":
                 if len(args) < 3:
                     sys.exit(f"usage: glm {cmd} chat \"your prompt\"")
+                require_armed(f"glm {cmd} chat")
                 proxy_chat(sec, " ".join(args[2:]))
             elif sub in (None, "status", "health"):
                 bu = sec.get("base_url"); key = sec.get("api_key", "")

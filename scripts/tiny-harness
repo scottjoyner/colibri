@@ -52,10 +52,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def p(*a): print(*a, flush=True)
 
+def require_armed(action):
+    if os.environ.get("COLI_LIVE") != "1":
+        p(f"DISARMED: '{action}' is a live action and will not run.")
+        p("  Arm only when the model/endpoint is verified ready: export COLI_LIVE=1")
+        sys.exit(2)
+
 if action == "serve":
     if sec.get("base_url") and not sec.get("model"):
         p(f"[tiny.{name}] remote endpoint only: {sec['base_url']} (no local serve)")
         sys.exit(0)
+    if not sec.get("model"):
+        sys.exit(f"[tiny.{name}] no 'model' set and no 'base_url'. Train first "
+                 f"(tiny-harness {name} train --run) then set model=, or set base_url= for a remote endpoint.")
     model = sec["model"]; port = sec.get("port", 8300)
     host = sec.get("host", "127.0.0.1"); mid = sec.get("model_id", name)
     key = sec.get("api_key", "local")
@@ -70,14 +79,16 @@ if action == "serve":
     for k,v in cfg.get("cache",{}).items():
         tmp.write(f'{k} = {v!r}\n' if isinstance(v,str) else f'{k} = {v}\n')
     tmp.close()
+    require_armed(f"tiny-harness {name} serve")
     p(f"[tiny.{name}] serving {mid} on {host}:{port}")
     os.execv(os.path.join(HERE,"scripts","colibri-serve"), [os.path.join(HERE,"scripts","colibri-serve"), tmp.name])
 
 elif action == "train":
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", action="store_true", help="only print the resolved plan")
-    ap.add_argument("--run", action="store_true", help="run prep + REAL training (default: prep + dry-run train)")
+    ap.add_argument("--run", action="store_true", help="REAL training (needs COLI_LIVE=1); default is prep + dry-run")
     ap.add_argument("--skip-prep", action="store_true", help="skip extract/clean/format; train only")
+    ap.add_argument("--overwrite", action="store_true", help="replace an existing checkpoint dir")
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--base", default=None)
@@ -92,6 +103,8 @@ elif action == "train":
     train_base = ns.base or sec.get("train_base") or sec.get("model")
     if not train_base:
         sys.exit(f"[tiny.{name}] set train_base= or model= (base model to fine-tune)")
+    if not os.path.exists(train_base):
+        sys.exit(f"[tiny.{name}] train_base NOT FOUND: {train_base}")
     train_output = ns.output or sec.get("train_output") or \
         f"/media/scott/SSD_4TB/finetune-staging/outputs/checkpoints/tiny-{name}"
     source = ns.source if ns.source is not None else sec.get("train_source")
@@ -106,11 +119,39 @@ elif action == "train":
     if ns.plan:
         sys.exit(0)
 
+    os.makedirs(train_output, exist_ok=True)
+
+    # ── guards ──────────────────────────────────────────────────────────────
+    # 1) lockfile: never run two training passes for the same subagent at once
+    lock = train_output + ".lock"
+    def _pid_alive(pid):
+        try: os.kill(pid, 0)
+        except OSError: return False
+        return True
+    held_pid = None
+    if os.path.exists(lock):
+        try: held_pid = int(open(lock).read().strip())
+        except Exception: held_pid = None
+        if held_pid and _pid_alive(held_pid):
+            sys.exit(f"[tiny.{name}] LOCKED by pid {held_pid} ({lock}); another run is active")
+    with open(lock, "w") as lf:
+        lf.write(str(os.getpid()))
+    # 2) no-clobber: refuse to overwrite existing checkpoints unless --overwrite
+    have_ckpt = any(
+        os.path.exists(os.path.join(train_output, f))
+        for f in os.listdir(train_output) if f.endswith(".safetensors") or f.startswith("checkpoint")) \
+        if os.path.isdir(train_output) else False
+    if have_ckpt and not ns.overwrite:
+        os.remove(lock)
+        sys.exit(f"[tiny.{name}] output dir has existing checkpoints; pass --overwrite to replace\n  {train_output}")
+    # 3) real training is a live action -> arm gate
+    if ns.run:
+        require_armed(f"tiny-harness {name} train --run")
+
+    # ── build the per-subagent config (never touch auto-finetune config.yaml) ─
     sys.path.insert(0, train_repo)
     from src.config import load, project_root
-    base_cfg_path = os.path.join(project_root(), "config.yaml")
-    c = load(base_cfg_path)
-    # apply per-subagent overrides (deep on the live dict; never touch repo config.yaml)
+    c = load(os.path.join(project_root(), "config.yaml"))
     c.raw.setdefault("train", {})
     c.raw["train"]["model_name"] = train_base
     c.raw["train"]["output_dir"] = train_output
@@ -127,18 +168,35 @@ elif action == "train":
         c.raw.setdefault("paths", {})["raw_dir"] = os.path.join(os.path.dirname(sec["dataset_dir"]), "raw")
         c.raw.setdefault("paths", {})["cleaned_dir"] = os.path.join(os.path.dirname(sec["dataset_dir"]), "cleaned")
 
-    if not ns.skip_prep:
-        p("[tiny.%s] extract -> clean -> format (opencode traces)" % name)
-        from src.extract_opencode import main as extract
-        from src.clean import main as clean
-        from src.format_dataset import main as fmt
-        c.ensure_dirs()
-        extract(c)
-        clean(c)
-        fmt(c, source=source)
-    from src.train import main as train
-    p("[tiny.%s] train stage (dry_run=%s)" % (name, not ns.run))
-    rc = train(c, dry_run=not ns.run, source=source, max_examples=ns.max_examples)
+    # run manifest (audit trail of exactly what this run did)
+    manifest = {"subagent": name, "argv": sys.argv[1:], "train_base": train_base,
+                "train_output": train_output, "source": source, "epochs": epochs,
+                "run": bool(ns.run), "pid": os.getpid(),
+                "started": __import__("datetime").datetime.now().isoformat()}
+    with open(os.path.join(train_output, "run-manifest.json"), "w") as mf:
+        json.dump(manifest, mf, indent=2)
+
+    try:
+        if not ns.skip_prep:
+            p("[tiny.%s] extract -> clean -> format (opencode traces)" % name)
+            from src.extract_opencode import main as extract
+            from src.clean import main as clean
+            from src.format_dataset import main as fmt
+            c.ensure_dirs()
+            extract(c); clean(c); fmt(c, source=source)
+            # abort if prep produced nothing trainable (don't burn GPU on empty set)
+            ds = c.path("dataset_dir")
+            tj = os.path.join(ds, "train.jsonl")
+            n = sum(1 for _ in open(tj)) if os.path.exists(tj) else 0
+            if n == 0:
+                sys.exit(f"[tiny.{name}] format produced 0 trainable examples (source={source}); aborting")
+            p(f"[tiny.{name}] dataset ready: {n} examples at {ds}")
+        from src.train import main as train
+        p("[tiny.%s] train stage (dry_run=%s)" % (name, not ns.run))
+        rc = train(c, dry_run=not ns.run, source=source, max_examples=ns.max_examples)
+    finally:
+        try: os.remove(lock)
+        except OSError: pass
     if ns.run:
         p(f"[tiny.{name}] training complete -> {train_output}")
         p(f"  next: set model = '{train_output}' (or its adapter) and run: tiny-harness {name} serve")
@@ -164,6 +222,7 @@ elif action == "eval":
     if not ns.live:
         p(f"[tiny.{name}] add --live to score the served endpoint on a {ns.holdout}-example holdout.")
         sys.exit(0)
+    require_armed(f"tiny-harness {name} eval --live")
     # live: hit base_url (or local serve) with held-out user prompts
     import urllib.request
     endpoint = sec.get("base_url") or f"http://{sec.get('host','127.0.0.1')}:{sec.get('port',8300)}/v1/chat/completions"
