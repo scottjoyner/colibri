@@ -75,6 +75,14 @@ def _endpoint_up(url, key="", timeout=4):
         return False, None
 
 
+def _disk_free_gb(path):
+    import shutil
+    try:
+        return shutil.disk_usage(path).free / (1 << 30)
+    except Exception:
+        return None
+
+
 def cmd_doctor(cfg):
     """Pre-flight validator: read-only checks that the fleet is safe to arm.
 
@@ -145,9 +153,50 @@ def cmd_doctor(cfg):
             parent = os.path.dirname(out) or "."
             add("PASS" if os.access(parent, os.W_OK) else "FAIL",
                 f"tiny.{nm}.train_output", f"parent writable: {parent}")
+            free = _disk_free_gb(parent)
+            if free is not None and free < 20.0:
+                add("WARN", f"tiny.{nm}.train_disk",
+                    f"only {free:.1f} GB free at {parent} (checkpoints can be several GB)")
         src = s.get("train_source")
         if src not in (None, "opencode", "hermes"):
             add("FAIL", f"tiny.{nm}.train_source", f"invalid: {src}")
+
+    # KV cache dir writability (engine creates <model>/.coli_kvdb at runtime)
+    cache = cfg.get("cache", {})
+    if cache.get("enabled", True) and prim.get("model"):
+        mdir = os.path.dirname(prim["model"]) or "."
+        kvdb = os.path.join(prim["model"], ".coli_kvdb")
+        if os.access(mdir, os.W_OK):
+            add("PASS", "kvdb.dir", f"writable: {kvdb}")
+        else:
+            add("WARN", "kvdb.dir", f"model dir not writable; cannot create {kvdb}")
+        need = max(1.0, (float(cache.get("hot_gb", 0.5) or 0.5)) * 1.5)
+        free = _disk_free_gb(mdir)
+        if free is None:
+            add("WARN", "disk[model]", f"cannot stat free space at {mdir}")
+        elif free < need:
+            add("WARN", "disk[model]", f"only {free:.1f} GB free at {mdir} (KV tier wants ~{need:.1f} GB)")
+        else:
+            add("PASS", "disk[model]", f"{free:.1f} GB free at {mdir}")
+
+    # training deps per subagent (training runs on a CUDA/ROCm box, not here)
+    for nm, s in (cfg.get("tiny", {}) or {}).items():
+        if not s.get("train_repo"):
+            continue
+        import importlib.util as _iu
+        have = lambda m: _iu.find_spec(m) is not None
+        missing = [m for m in ("peft", "unsloth", "transformers", "datasets") if not have(m)]
+        gpu = False
+        try:
+            import torch as _t
+            gpu = _t.cuda.is_available() or "rocm" in str(getattr(_t.version, "__version__", "")).lower()
+        except Exception:
+            pass
+        if missing or not gpu:
+            add("WARN", f"tiny.{nm}.train_deps",
+                f"missing={missing or 'none'}; torch GPU={gpu} (training must run on a CUDA/ROCm box)")
+        else:
+            add("PASS", f"tiny.{nm}.train_deps", "peft/unsloth/transformers/datasets + torch GPU present")
 
     order = {"PASS": 0, "WARN": 1, "FAIL": 2}
     rows.sort(key=lambda r: (order[r[0]], r[1]))
@@ -321,8 +370,14 @@ def run_proxy(cfg):
     max_body = int(proxy.get("max_body_bytes", 8 * 1024 * 1024))
     br_fail = int(proxy.get("breaker_failures", 5))
     br_cooldown = int(proxy.get("breaker_cooldown_s", 30))
+    max_conn = int(proxy.get("max_connections", 64))
+    require_auth = bool(proxy.get("require_auth", False))
+    proxy_key = proxy.get("api_key", "")
     import time as _time
+    import threading as _threading
     breaker = {}  # target_url -> {"fails": int, "open_until": float}
+    _inflight = [0]
+    _inflight_lock = _threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def _read_body(self):
@@ -380,12 +435,15 @@ def run_proxy(cfg):
             self.send_header("Content-Type", ct)
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            while True:
-                chunk = r.read(1 << 16)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+            try:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, OSError) as e:
+                eprint(f"[proxy] client disconnected mid-stream: {e}")
 
         def do_GET(self):
             if self.path.rstrip("/") in ("/health", "/v1/health"):
@@ -400,17 +458,42 @@ def run_proxy(cfg):
 
         def do_POST(self):
             if self.path.rstrip("/") in ("/v1/chat/completions", "/chat/completions"):
-                body = self._read_body()
-                if "__too_large__" in body:
-                    self.send_response(413)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": {"message": f"request too large ({body['__too_large__']} bytes)",
-                                                             "type": "payload_too_large"}}).encode())
-                    return
-                label, bu, key, mid = pick_backend(cfg, body)
-                eprint(f"[proxy] -> {label} ({bu})")
-                self._forward(bu.rstrip("/") + "/chat/completions", key, mid, body)
+                # optional auth on the proxy port itself
+                if require_auth and proxy_key:
+                    auth = self.headers.get("Authorization", "")
+                    if auth != f"Bearer {proxy_key}" and auth.split(" ", 1)[-1] != proxy_key:
+                        self.send_response(401)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": {"message": "unauthorized",
+                                                               "type": "unauthorized"}}).encode())
+                        return
+                # concurrency guard: shed load instead of exhausting threads
+                with _inflight_lock:
+                    if _inflight[0] >= max_conn:
+                        self.send_response(429)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Retry-After", "1")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": {"message": "too many concurrent requests",
+                                                               "type": "busy"}}).encode())
+                        return
+                    _inflight[0] += 1
+                try:
+                    body = self._read_body()
+                    if "__too_large__" in body:
+                        self.send_response(413)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": {"message": f"request too large ({body['__too_large__']} bytes)",
+                                                                 "type": "payload_too_large"}}).encode())
+                        return
+                    label, bu, key, mid = pick_backend(cfg, body)
+                    eprint(f"[proxy] -> {label} ({bu})")
+                    self._forward(bu.rstrip("/") + "/chat/completions", key, mid, body)
+                finally:
+                    with _inflight_lock:
+                        _inflight[0] = max(0, _inflight[0] - 1)
                 return
             self.send_response(404); self.end_headers()
 
@@ -516,15 +599,23 @@ def run_harness(cfg, task):
     subagent (tiny.<name>) endpoint in parallel, results are collected and the
     orchestrator synthesizes a final answer.
 
-    This is the skeleton: the orchestrator prompt + subtask parsing are TODO
-    and should match whatever the harness-orchestrator model expects.
+    Hardened: plan is schema-validated (unknown/empty subtasks dropped), each
+    subtask runs with a timeout + bounded retries, results are truncated before
+    synthesis, and the fan-out respects a per-subtask timeout so one slow
+    subagent can't hang the whole task.
     """
     h = cfg.get("harness", {})
     if not h.get("enabled", True):
         sys.exit("harness disabled in config ([harness].enabled=false)")
     obu = h.get("base_url"); okey = h.get("api_key", ""); omodel = h.get("model_id", "model")
     subs = h.get("subagents", [])
+    if not subs:
+        sys.exit("[harness] no subagents configured ([harness].subagents)")
     max_sub = int(h.get("max_subtasks", 8))
+    orch_timeout = int(h.get("orchestrator_timeout_s", 180))
+    subtask_timeout = int(h.get("subtask_timeout_s", 120))
+    max_result = int(h.get("max_result_chars", 4000))
+    retries = int(h.get("subtask_retries", 1))
     if not task or task == "-":
         task = sys.stdin.read().strip()
     if not task:
@@ -540,43 +631,77 @@ def run_harness(cfg, task):
         {"role": "user", "content": task},
     ]
     try:
-        plan_text = chat_completion(obu, okey, omodel, plan_prompt)
+        plan_text = chat_completion(obu, okey, omodel, plan_prompt, timeout=orch_timeout)
     except Exception as e:
         sys.exit(f"[harness] orchestrator unreachable: {e}")
-    # 2) parse the plan (best-effort: extract the first JSON array)
+    # 2) parse + validate the plan (drop unknown/empty subtasks)
     import re
+    from concurrent.futures import as_completed
     m = re.search(r"\[.*\]", plan_text, re.DOTALL)
     try:
-        plan = json.loads(m.group(0)) if m else [{"subagent": subs[0] if subs else "example", "task": task}]
+        raw = json.loads(m.group(0)) if m else []
     except Exception:
-        plan = [{"subagent": subs[0] if subs else "example", "task": task}]
+        raw = []
+    if not isinstance(raw, list):
+        raw = [{"subagent": subs[0], "task": task}]
+    plan = []
+    for it in raw:
+        if not isinstance(it, dict):
+            eprint(f"[harness] drop non-object subtask: {it!r}")
+            continue
+        nm = it.get("subagent")
+        if nm not in subs:
+            eprint(f"[harness] drop subtask for unknown subagent '{nm}' (valid: {subs})")
+            continue
+        if not isinstance(it.get("task"), str) or not it["task"].strip():
+            eprint(f"[harness] drop subtask with empty task for '{nm}'")
+            continue
+        plan.append(it)
     plan = plan[:max_sub]
-    eprint(f"[harness] plan: {len(plan)} subtask(s)")
+    if not plan:
+        sys.exit("[harness] orchestrator returned no valid subtasks; aborting")
+    eprint(f"[harness] plan: {len(plan)} valid subtask(s)")
 
     # 3) fan out each subtask to its subagent (tiny.<name>) endpoint in parallel
     def run_sub(sub):
-        name = sub.get("subagent", subs[0] if subs else "example")
-        stext = sub.get("task", task)
+        name = sub["subagent"]; stext = sub["task"]
         sec = cfg.get("tiny", {}).get(name)
         if not sec or not sec.get("base_url"):
             return name, f"[no [tiny.{name}] endpoint configured]"
-        try:
-            res = chat_completion(sec["base_url"], sec.get("api_key", ""),
-                                   sec.get("model_id", name),
-                                   [{"role": "user", "content": stext}])
-            return name, res
-        except Exception as e:
-            return name, f"[subagent {name} error: {e}]"
+        last = None
+        for attempt in range(1, retries + 1):
+            try:
+                last = chat_completion(sec["base_url"], sec.get("api_key", ""),
+                                       sec.get("model_id", name),
+                                       [{"role": "user", "content": stext}],
+                                       timeout=subtask_timeout)
+                if len(last) > max_result:
+                    last = last[:max_result] + f"\n...[truncated {len(last) - max_result} chars]"
+                return name, last
+            except Exception as e:
+                last = e
+                eprint(f"[harness] {name} attempt {attempt}/{retries} failed: {e}")
+        return name, f"[subagent {name} error after {retries} attempts: {last}]"
 
+    results = []
     with ThreadPoolExecutor(max_workers=max_sub) as ex:
-        results = list(ex.map(run_sub, plan))
+        futs = {ex.submit(run_sub, sub): sub for sub in plan}
+        for fut in as_completed(futs):
+            nm = futs[fut]["subagent"]
+            try:
+                results.append(fut.result(timeout=subtask_timeout))
+            except Exception as e:
+                results.append((nm, f"[subagent {nm} timeout: {e}]"))
+    # keep original plan order for the synthesis context
+    order = {s["subagent"]: i for i, s in enumerate(plan)}
+    results.sort(key=lambda r: order.get(r[0], 1 << 30))
 
     # 4) orchestrator synthesizes the final answer from the subtask results
     synth_msgs = [{"role": "system", "content": "Synthesize a final answer from the subtask "
                   "results below."},
                   {"role": "user", "content": "\n\n".join(f"[{n}]\n{r}" for n, r in results)}]
     try:
-        final = chat_completion(obu, okey, omodel, synth_msgs)
+        final = chat_completion(obu, okey, omodel, synth_msgs, timeout=orch_timeout)
     except Exception as e:
         final = "\n\n".join(f"[{n}]\n{r}" for n, r in results)  # fallback: raw concat
     print(final)

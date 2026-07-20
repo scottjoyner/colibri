@@ -73,6 +73,8 @@ rewrite_model_id = true
 max_body_bytes = 8388608          # 8 MiB
 breaker_failures = 5              # open circuit after this many failures
 breaker_cooldown_s = 30           # keep it open this long before retrying
+max_connections = 64              # shed (429) beyond this many in-flight requests
+require_auth = false              # if true, proxy port requires Bearer proxy.api_key
 
 # Example small-model harness. `tiny-example` is proxy-only for now (remote);
 # `tiny.coder` is a LOCAL, trainable example that drives the auto-finetune
@@ -129,3 +131,8 @@ model_id = "harness-orchestrator"
 # subagents fanned out in parallel (each must have a [tiny.<name>] section)
 subagents = ["example"]
 max_subtasks = 8
+# Hardening / tuning for the fan-out:
+orchestrator_timeout_s = 180     # timeout for plan + synthesize calls
+subtask_timeout_s = 120          # per-subagent call timeout
+subtask_retries = 1              # retry attempts per subtask before giving up
+max_result_chars = 4000          # truncate each subagent result before synthesis

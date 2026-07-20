@@ -64,19 +64,42 @@ are always allowed. `glm arm` / `glm disarm` print the exact `export`/`unset`.
 Checks: config sections present; port collisions + availability; local model paths exist;
 remote helper/hermes endpoints reachable; per-subagent training prerequisites
 (`train_repo/src`, `train_base` exists, `train_output` parent writable, valid
-`train_source`). Prints PASS/WARN/FAIL; exits non-zero if any FAIL.
+`train_source`). **Plus:** KV cache dir writability (`<primary.model>/.coli_kvdb`);
+disk-headroom at the model dir (KV tier) and at each `train_output` parent (checkpoints);
+and training-dep availability per subagent (peft/unsloth/transformers/datasets + whether
+torch has a CUDA/ROCm backend — warns that training must run on a GPU box). Prints
+PASS/WARN/FAIL; exits non-zero if any FAIL.
 
 ### Proxy hardening
 - **Request size cap** (`proxy.max_body_bytes`, default 8 MiB) → `413` on oversized bodies.
 - **Circuit breaker** (`proxy.breaker_failures` / `breaker_cooldown_s`) → after N
   consecutive upstream failures the upstream returns `503` for the cooldown window instead
   of hanging every request for the 600 s timeout.
+- **Concurrency guard** (`proxy.max_connections`, default 64) → `429` when more requests are
+  in flight than the limit, so the proxy sheds load instead of exhausting threads.
+- **Optional auth** (`proxy.require_auth = true`) → the proxy port itself requires
+  `Bearer <proxy.api_key>` (`401` otherwise). Off by default to avoid breaking opencode.
+- **Client-abort handling**: a disconnected client during streaming no longer raises an
+  uncaught traceback; it is logged and the upstream is closed cleanly.
 
 ### Hermes hardening
 - `glm hermes config` redacts the `api_key` by default (`--show-key` to reveal;
   `--apply` writes the file with a `.bak` backup; `--out=PATH` chooses destination).
 - `glm hermes check` verifies `/health` **and** that the configured `model_id` is actually
   advertised by `/v1/models` (warns if not), so a half-configured adapter is caught early.
+
+### Tier-3 harness hardening (`glm harness`)
+- **Plan schema validation**: orchestrator output is parsed and validated — subtasks with an
+  unknown `subagent` or an empty `task` are dropped (with a log line), so a malformed plan
+  can't fan out to a non-existent endpoint or hang. Aborts if zero valid subtasks remain.
+- **Per-subtask timeout** (`harness.subtask_timeout_s`, default 120) + **bounded retries**
+  (`harness.subtask_retries`, default 1): a slow/dead subagent can't stall the whole task.
+- **Result truncation** (`harness.max_result_chars`, default 4000): each subagent result is
+  capped before synthesis so one verbose subagent can't blow the orchestrator context.
+- **Orchestrator timeouts** (`harness.orchestrator_timeout_s`, default 180) on the plan and
+  synthesize calls.
+- Still DISARMED by default (needs `COLI_LIVE=1`); synthesis falls back to raw concatenation
+  if the orchestrator is unreachable.
 
 ### tiny-harness training hardening
 - **Armed gate** on `serve` and `train --run` / `eval --live`.
