@@ -14,6 +14,10 @@ Routes by role to the right model/endpoint defined in configs/colibri.toml:
     glm route "<prompt>"    # dry-run: print which backend a request would hit
     glm health              # health of every configured endpoint
     glm ls                  # list configured roles
+    glm neutronstar build   # build ds4 / ds4-server (HX 370 / Strix Halo)
+    glm neutronstar serve   # launch ds4-server for a GGUF (machine-aware)
+    glm neutronstar status  # check ds4-server health + advertised models
+    glm neutronstar bench   # compare colibri primary vs ds4-server tok/s
 
 Local roles (have a `model` path) are served via scripts/colibri-serve.
 Remote roles (have a `base_url`, no `model`) are proxied/queried.
@@ -707,6 +711,76 @@ def run_harness(cfg, task):
     print(final)
 
 
+def cmd_neutronstar(cfg, args):
+    """NeutronStar (ds4) lifecycle wrapper: build / serve / status / bench.
+
+    Defaults to the HX 370 (gfx1150, 96 GB) machine; pass 'halo' for Strix Halo.
+    The NeutronStar repo lives at $NEUTRONSTAR_DIR (default ~/git/neutronstar).
+    `serve`/`build` are live actions (compile / bind a port) and require COLI_LIVE.
+    """
+    ns_dir = os.environ.get("NEUTRONSTAR_DIR", os.path.expanduser("~/git/neutronstar"))
+    if not os.path.isdir(ns_dir):
+        sys.exit(f"NeutronStar repo not found: {ns_dir} (set $NEUTRONSTAR_DIR)")
+    sub = args[1] if len(args) > 1 else None
+
+    if sub in (None, "help", "-h"):
+        eprint("glm neutronstar <subcommand>")
+        eprint("  build [hx370|halo]                 build ds4 / ds4-server (live)")
+        eprint("  serve <model.gguf> [port] [hx370|halo]   launch ds4-server (live)")
+        eprint("  status [port]                      check ds4-server /health + /v1/models")
+        eprint("  bench [extra bench-fleet args]      compare colibri primary vs ds4-server tok/s")
+        return
+
+    if sub == "build":
+        machine = args[2] if len(args) > 2 else "hx370"
+        require_armed("glm neutronstar build")
+        if machine == "hx370":
+            script = os.path.join(ns_dir, "build-hx370.sh")
+            os.execv(script, [script])
+        os.execv("/usr/bin/make", ["make", "-C", ns_dir, "strix-halo"])
+        return
+
+    if sub == "serve":
+        if len(args) < 3:
+            sys.exit("usage: glm neutronstar serve <model.gguf> [port] [hx370|halo]")
+        model = args[2]; port = args[3] if len(args) > 3 else "8000"
+        machine = args[4] if len(args) > 4 else "hx370"
+        require_armed("glm neutronstar serve")
+        script = os.path.join(ns_dir, "scripts", "serve.sh")
+        if not os.path.exists(script):
+            sys.exit(f"serve script missing: {script}")
+        os.execv(script, [script, machine, model, port])
+        return
+
+    if sub == "status":
+        port = args[2] if len(args) > 2 else "8000"
+        base = f"http://127.0.0.1:{port}"
+        up, data = _endpoint_up(base + "/health")
+        if not up:
+            eprint(f"ds4-server: DOWN at {base} (start with: glm neutronstar serve <model.gguf>)")
+            return
+        eprint(f"ds4-server: OK {base}/health")
+        upm, mdata = _endpoint_up(base + "/v1/models")
+        if upm and mdata:
+            ids = [m.get("id") for m in mdata.get("data", [])]
+            eprint(f"  models: {ids}")
+        return
+
+    if sub == "bench":
+        script = os.path.join(HERE, "scripts", "bench-fleet")
+        if not os.path.exists(script):
+            sys.exit(f"bench-fleet missing: {script}")
+        prim = cfg.get("primary", {})
+        a_url = f"http://{prim.get('host','127.0.0.1')}:{int(prim.get('port',8000))}/v1"
+        a_model = prim.get("model_id", "model")
+        b_url = "http://127.0.0.1:8100/v1"
+        os.execv(script, [script, "--a-url", a_url, "--a-model", a_model,
+                           "--b-url", b_url, "--b-model", "glm-5.2-chat"] + args[2:])
+        return
+
+    sys.exit(f"unknown neutronstar subcommand: {sub}")
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
@@ -772,6 +846,8 @@ def main():
         require_armed("glm harness")
         task = args[1] if len(args) > 1 else None
         run_harness(cfg, task); return
+    if cmd == "neutronstar":
+        cfg, _ = load_cfg(); cmd_neutronstar(cfg, args); return
     if cmd in ("opencode", "hermes") or cmd.startswith("tiny-"):
         cfg, _ = load_cfg()
         role, sec, is_local = resolve_role(cfg, cmd)
