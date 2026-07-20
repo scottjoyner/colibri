@@ -13,7 +13,7 @@ model = "/media/scott/SSD_4TB/models-fast/GLM-5.2-colibri-int4-with-int8-mtp"
 model_id = "glm-5.2-colibri"
 # OpenAI-compatible listen address/port for this node
 host = "127.0.0.1"
-port = 8000
+port = 8100
 api_key = "local-glm52"
 
 # Generation / memory profile for the 744B on 96 GB RAM
