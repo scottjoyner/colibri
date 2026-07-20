@@ -1,0 +1,56 @@
+# colibri local inference fleet — primary node config
+#
+# This is the config for the LOCAL PRIMARY (this HX370 box): GLM-5.2-colibri
+# as the heavy hitter, with the HOT RAM + SSD KV cache tiers. Smaller helper
+# models (fine-tuned off opencode traces) run on OTHER devices and are reached
+# through the [helper] endpoints below. opencode fans tasks to GLM vs helper.
+#
+# Edit the values, then launch with:  scripts/colibri-serve configs/colibri.toml
+
+[primary]
+# GLM-5.2-colibri int4+int8-MTP snapshot (reads from SNAP env inside gli)
+model = "/media/scott/SSD_4TB/models-fast/GLM-5.2-colibri-int4-with-int8-mtp"
+model_id = "glm-5.2-colibri"
+# OpenAI-compatible listen address/port for this node
+host = "127.0.0.1"
+port = 8000
+api_key = "local-glm52"
+
+# Generation / memory profile for the 744B on 96 GB RAM
+ram_gb = 67          # expert cache budget (rest auto for dense/attn)
+ngen = 1024          # safety cap on generated tokens
+kv_slots = 4         # parallel conversation slots (each = one KV slot)
+max_queue = 8
+queue_timeout = 300
+
+[cache]
+# Global hash-keyed KV cache DB on the fast SSD (shared across processes).
+enabled = true
+# In-process HOT RAM tier in front of the SSD store. Holds the system prompts
+# we hotswap between sessions so a new conversation is a memcpy, not a prefill.
+# 0.5 GB ~ hundreds of prompts; raise if you keep many distinct system prompts.
+hot_gb = 0.5
+# Normalize volatile tokens (timestamp/date/cwd/path/key=value) before hashing
+# so the cache hits across sessions even when opencode injects a fresh timestamp.
+normalize = true
+# Directory of static system-prompt files (.json/.md/.txt/.yaml/.yml) to
+# prewarm into HOT+SSD at startup. Matches the exact prompt opencode sends,
+# so the FIRST request of every session is free. Leave "" to skip prewarming.
+prime_dir = ""
+
+[helper]
+# Smaller fine-tuned LM (trained on opencode traces) running on ANOTHER device.
+# opencode routes cheap/high-frequency turns (classify, route, tool-shaping,
+# scratch) here; GLM-5.2 handles the heavy reasoning/codegen.
+#
+# This node only needs the ENDPOINT to talk to it. Run the helper model with
+# its own `coli serve` (or any OpenAI-compatible server) on the helper device,
+# then point opencode at it via configs/opencode.colibri.jsonc.
+enabled = false
+base_url = "http://helper-device.local:8100/v1"
+api_key = "helper-local"
+model_id = "hermes-helper-finetune"
+
+# Token-budget heuristic for the local router (if you enable the coli proxy):
+# tasks estimated under `route_max_tokens` go to the helper, else GLM.
+route_max_tokens = 256

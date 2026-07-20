@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# colibri-serve — launch the local GLM-5.2 primary with the HOT RAM + SSD KV
+# cache tiers wired in, from a configs/colibri.toml profile.
+#
+# Usage:
+#   scripts/colibri-serve [path/to/colibri.toml]
+#   COLI_CONFIG=path/to/colibri.toml scripts/colibri-serve
+#
+# The launcher reads the TOML, exports the engine env (KVDB/KVHOT/normalize/
+# prime), and execs `coli serve`. It does not touch any default config.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CFG="${1:-${COLI_CONFIG:-$HERE/configs/colibri.toml}}"
+[ -f "$CFG" ] || { echo "config not found: $CFG" >&2; exit 1; }
+
+# --- tiny TOML reader (stdlib tomllib on 3.11+, else minimal parser) ---
+read_cfg() {
+  python3 - "$CFG" "$@" <<'PY'
+import sys, re
+path = sys.argv[1]; wanted = sys.argv[2:]
+try:
+    import tomllib
+    with open(path,'rb') as f: d = tomllib.load(f)
+    def get(sec,key): return d.get(sec,{}).get(key)
+except ModuleNotFoundError:
+    # minimal: [section] then key = "value" or key = true/false/123
+    d={}; sec=None
+    for line in open(path,encoding='utf-8'):
+        line=line.split('#',1)[0].strip()
+        if not line: continue
+        m=re.match(r'\[(\w+)\]',line)
+        if m: sec=m.group(1); d.setdefault(sec,{}); continue
+        m=re.match(r'(\w+)\s*=\s*(.+)',line)
+        if m and sec:
+            k=m.group(1); v=m.group(2).strip()
+            if v.startswith('"') and v.endswith('"') or v.startswith("'") and v.endswith("'"):
+                v=v[1:-1]
+            elif v.lower() in ('true','false'): v = v.lower()=='true'
+            else:
+                try: v=int(v)
+                except ValueError:
+                    try: v=float(v)
+                    except ValueError: pass
+            d[sec][k]=v
+    def get(sec,key): return d.get(sec,{}).get(key)
+for w in wanted:
+    sec,key=w.split('.')
+    v=get(sec,key)
+    print('' if v is None else v)
+PY
+}
+
+model=$(read_cfg primary.model)
+model_id=$(read_cfg primary.model_id)
+host=$(read_cfg primary.host)
+port=$(read_cfg primary.port)
+api_key=$(read_cfg primary.api_key)
+ram_gb=$(read_cfg primary.ram_gb)
+ngen=$(read_cfg primary.ngen)
+kv_slots=$(read_cfg primary.kv_slots)
+max_queue=$(read_cfg primary.max_queue)
+queue_timeout=$(read_cfg primary.queue_timeout)
+
+cache_on=$(read_cfg cache.enabled)
+hot_gb=$(read_cfg cache.hot_gb)
+normalize=$(read_cfg cache.normalize)
+prime_dir=$(read_cfg cache.prime_dir)
+
+[ -n "$model" ] || { echo "primary.model missing in $CFG" >&2; exit 1; }
+
+export COLI_MODEL="$model"
+export COLI_MODEL_ID="$model_id"
+export COLI_API_KEY="$api_key"
+
+# Engine env for the KV cache tiers
+if [ "$cache_on" = "True" ] || [ "$cache_on" = "true" ] || [ "$cache_on" = "1" ]; then
+  export COLI_KVDB=1
+  [ -n "$hot_gb" ]   && export COLI_KVHOT_GB="$hot_gb"
+  if [ "$normalize" = "True" ] || [ "$normalize" = "true" ] || [ "$normalize" = "1" ]; then
+    export COLI_KVDB_NORMALIZE=1
+  fi
+  if [ -n "$prime_dir" ] && [ -e "$prime_dir" ]; then
+    export COLI_KVDB_PRIME="$prime_dir"
+  fi
+fi
+export COLI_KVDB_PRIME="${COLI_KVDB_PRIME:-}"
+
+echo "colibri primary: model=$model_id port=$port cache=${cache_on} hot_gb=${hot_gb} normalize=${normalize} prime=${prime_dir:-none}"
+
+exec "$HERE/c/coli" serve \
+  --model "$model" \
+  --host "$host" \
+  --port "$port" \
+  --model-id "$model_id" \
+  --api-key "$api_key" \
+  --ram "$ram_gb" \
+  --ngen "$ngen" \
+  --kv-slots "$kv_slots" \
+  --max-queue "$max_queue" \
+  --queue-timeout "$queue_timeout"

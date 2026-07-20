@@ -1,0 +1,19 @@
+[Unit]
+Description=Colibri GLM-5.2 primary (HOT RAM + SSD KV cache tiers)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/scott/git/colibri
+
+# The launcher reads configs/colibri.toml and exports the engine env
+# (KVDB / KVHOT_GB / KVDB_NORMALIZE / KVDB_PRIME) before exec'ing coli serve.
+Environment=COLI_CONFIG=/home/scott/git/colibri/configs/colibri.toml
+
+ExecStart=/home/scott/git/colibri/scripts/colibri-serve
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    // PRIMARY — local GLM-5.2-colibri on this HX370 box (heavy reasoning/codegen).
+    // HOT RAM + SSD KV cache tiers make repeated system-prompt prefill a free memcpy.
+    "glm52-colibri": {
+      "model": "glm-5.2-colibri",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "local-glm52"
+      }
+    },
+    // HELPER — smaller LM fine-tuned on opencode traces, running on another device.
+    // Route cheap/high-frequency turns (classify, route, tool-shaping, scratch) here.
+    "hermes-helper": {
+      "model": "hermes-helper-finetune",
+      "options": {
+        "baseURL": "http://helper-device.local:8100/v1",
+        "apiKey": "helper-local"
+      }
+    }
+  }
+}
