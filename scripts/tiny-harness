@@ -1,48 +1,64 @@
 #!/usr/bin/env bash
-# tiny-harness — skeleton for a small local LM fine-tuned on opencode traces.
+# tiny-harness — a small local LM fine-tuned on opencode traces, run in parallel
+# with the GLM-5.2 primary to absorb cheap/high-frequency turns.
 #
 # This is the FUTURE piece: a smaller model (e.g. hermes-helper-finetune) that
-# runs in parallel with the GLM-5.2 primary, handling cheap/high-frequency
-# turns. The serving half is wired; the TRAINING/EVAL half is a TODO.
+# handles classify / route / format / tool-shaping while GLM-5.2 does the heavy
+# reasoning and codegen. The serving half is wired; the TRAINING half now drives
+# the auto-finetune pipeline (extract -> clean -> format -> train) on opencode
+# session traces, scoped per-subagent.
 #
-# Usage:  scripts/tiny-harness <name> [serve|train|eval]
+# Usage:  scripts/tiny-harness <name> [serve|train|eval] [flags]
 #   name   = the [tiny.<name>] section in configs/colibri.toml
 #
 # Config (configs/colibri.toml):
-#   [tiny.myharness]
-#   model   = "/path/to/small-model"   # local -> served via colibri-serve
-#   # OR
-#   base_url = "http://other-device:8100/v1"  # remote -> proxy only
-#   model_id = "myharness"
-#   host = "127.0.0.1"; port = 8300
+#   [tiny.coder]
+#   model        = "/path/to/small-finetune"   # local -> served via colibri-serve
+#   # OR (remote, proxy-only):
+#   base_url     = "http://other-device:8300/v1"
+#   model_id     = "coder"
+#   host         = "127.0.0.1"; port = 8300; api_key = "local"
+#   # training (tiny-harness train): drives the auto-finetune repo
+#   train_repo   = "/home/scott/git/auto-finetune"   # the pipeline repo
+#   train_base   = "/media/scott/SSD_4TB/models-fast/RefinedNeuro/RefinedToolCallV5-3b"
+#   train_output = "/media/scott/SSD_4TB/finetune-staging/outputs/checkpoints/tiny-coder"
+#   train_epochs = 2
+#   train_source = "opencode"   # opencode | hermes | null(merged)
+#   system_prompt = ""          # optional override for the format template
 #
 # Subcommands:
 #   serve   launch a local OpenAI-compatible server for the small model (coli serve)
-#   train   FINE-TUNE on opencode traces  (TODO — plug your pipeline here)
-#   eval    EVALUATE the harness vs GLM on a held-out trace set  (TODO)
+#   train   FINE-TUNE on opencode traces via the auto-finetune pipeline
+#             flags: [--plan] [--run] [--skip-prep] [--max-examples=N]
+#                    [--epochs=N] [--base=PATH] [--output=DIR] [--source=SRC]
+#   eval    EVALUATE the harness vs GLM on a held-out trace set
+#             flags: [--live]  (hit the served endpoint; else dataset stats only)
 set -euo pipefail
 
-NAME="${1:-}"; ACTION="${2:-serve}"
-[ -n "$NAME" ] || { echo "usage: tiny-harness <name> [serve|train|eval]" >&2; exit 1; }
+NAME="${1:-}"; ACTION="${2:-serve}"; shift 2 2>/dev/null || true
+[ -n "$NAME" ] || { echo "usage: tiny-harness <name> [serve|train|eval] [flags]" >&2; exit 1; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CFG="${COLI_CONFIG:-$HERE/configs/colibri.toml}"
-python3 - "$CFG" "$NAME" "$ACTION" <<'PY'
-import sys, os, json, tomllib, subprocess
+python3 - "$CFG" "$NAME" "$ACTION" "$@" <<'PY'
+import sys, os, json, tomllib, argparse
 cfg_path, name, action = sys.argv[1], sys.argv[2], sys.argv[3]
+rest = sys.argv[4:]
 cfg = tomllib.load(open(cfg_path,"rb"))
-sec = cfg.get(f"tiny.{name}")
+sec = cfg.get("tiny", {}).get(name)
 if not sec:
     sys.exit(f"no [tiny.{name}] section in {cfg_path}")
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+def p(*a): print(*a, flush=True)
+
 if action == "serve":
     if sec.get("base_url") and not sec.get("model"):
-        print(f"[tiny.{name}] remote endpoint only: {sec['base_url']} (no local serve)")
+        p(f"[tiny.{name}] remote endpoint only: {sec['base_url']} (no local serve)")
         sys.exit(0)
     model = sec["model"]; port = sec.get("port", 8300)
     host = sec.get("host", "127.0.0.1"); mid = sec.get("model_id", name)
     key = sec.get("api_key", "local")
-    # build an ad-hoc primary-style config so colibri-serve wires the tiers
     import tempfile
     tmp = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, dir=HERE)
     tmp.write('[primary]\n')
@@ -54,23 +70,128 @@ if action == "serve":
     for k,v in cfg.get("cache",{}).items():
         tmp.write(f'{k} = {v!r}\n' if isinstance(v,str) else f'{k} = {v}\n')
     tmp.close()
-    print(f"[tiny.{name}] serving {mid} on {host}:{port}")
+    p(f"[tiny.{name}] serving {mid} on {host}:{port}")
     os.execv(os.path.join(HERE,"scripts","colibri-serve"), [os.path.join(HERE,"scripts","colibri-serve"), tmp.name])
+
 elif action == "train":
-    # TODO: plug your fine-tune pipeline here. Suggested shape:
-    #   1. collect opencode traces (already on this box)
-    #   2. format as chat_template rows
-    #   3. fine-tune the small base -> sec["model"]
-    #   4. re-run `tiny-harness <name> serve` + `glm proxy` to route to it
-    print(f"[tiny.{name}] TRAIN not implemented yet (TODO).")
-    print(f"  traces: opencode history on this box")
-    print(f"  target model: {sec.get('model')}")
-    print(f"  after training: `glm tiny-{name} serve` then point glm proxy at it")
-    sys.exit(0)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--plan", action="store_true", help="only print the resolved plan")
+    ap.add_argument("--run", action="store_true", help="run prep + REAL training (default: prep + dry-run train)")
+    ap.add_argument("--skip-prep", action="store_true", help="skip extract/clean/format; train only")
+    ap.add_argument("--max-examples", type=int, default=None)
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--base", default=None)
+    ap.add_argument("--output", default=None)
+    ap.add_argument("--source", default=None, choices=["opencode","hermes",None])
+    ns = ap.parse_args(rest)
+
+    train_repo = sec.get("train_repo", "/home/scott/git/auto-finetune")
+    src_dir = os.path.join(train_repo, "src")
+    if not os.path.isdir(src_dir):
+        sys.exit(f"[tiny.{name}] train_repo not found (need {src_dir})")
+    train_base = ns.base or sec.get("train_base") or sec.get("model")
+    if not train_base:
+        sys.exit(f"[tiny.{name}] set train_base= or model= (base model to fine-tune)")
+    train_output = ns.output or sec.get("train_output") or \
+        f"/media/scott/SSD_4TB/finetune-staging/outputs/checkpoints/tiny-{name}"
+    source = ns.source if ns.source is not None else sec.get("train_source")
+    epochs = ns.epochs or sec.get("train_epochs")
+
+    p(f"[tiny.{name}] train plan:")
+    p(f"  pipeline repo : {train_repo}")
+    p(f"  trace source  : {source or 'merged (opencode+hermes)'}")
+    p(f"  base model    : {train_base}")
+    p(f"  output dir    : {train_output}")
+    p(f"  epochs        : {epochs}")
+    if ns.plan:
+        sys.exit(0)
+
+    sys.path.insert(0, train_repo)
+    from src.config import load, project_root
+    base_cfg_path = os.path.join(project_root(), "config.yaml")
+    c = load(base_cfg_path)
+    # apply per-subagent overrides (deep on the live dict; never touch repo config.yaml)
+    c.raw.setdefault("train", {})
+    c.raw["train"]["model_name"] = train_base
+    c.raw["train"]["output_dir"] = train_output
+    if epochs is not None:
+        c.raw["train"]["num_train_epochs"] = epochs
+    for k in ("lora_r","lora_alpha","lora_dropout","max_seq_length","learning_rate",
+              "per_device_train_batch_size","gradient_accumulation_steps","backend","load_in_4bit"):
+        if k in sec:
+            c.raw["train"][k] = sec[k]
+    if sec.get("system_prompt"):
+        c.raw.setdefault("format", {})["system_prompt"] = sec["system_prompt"]
+    if sec.get("dataset_dir"):
+        c.raw.setdefault("paths", {})["dataset_dir"] = sec["dataset_dir"]
+        c.raw.setdefault("paths", {})["raw_dir"] = os.path.join(os.path.dirname(sec["dataset_dir"]), "raw")
+        c.raw.setdefault("paths", {})["cleaned_dir"] = os.path.join(os.path.dirname(sec["dataset_dir"]), "cleaned")
+
+    if not ns.skip_prep:
+        p("[tiny.%s] extract -> clean -> format (opencode traces)" % name)
+        from src.extract_opencode import main as extract
+        from src.clean import main as clean
+        from src.format_dataset import main as fmt
+        c.ensure_dirs()
+        extract(c)
+        clean(c)
+        fmt(c, source=source)
+    from src.train import main as train
+    p("[tiny.%s] train stage (dry_run=%s)" % (name, not ns.run))
+    rc = train(c, dry_run=not ns.run, source=source, max_examples=ns.max_examples)
+    if ns.run:
+        p(f"[tiny.{name}] training complete -> {train_output}")
+        p(f"  next: set model = '{train_output}' (or its adapter) and run: tiny-harness {name} serve")
+    else:
+        p(f"[tiny.{name}] dry-run only. Re-run with --run to actually fine-tune.")
+    sys.exit(rc)
+
 elif action == "eval":
-    # TODO: score the harness vs GLM on a held-out trace set; emit routing stats
-    print(f"[tiny.{name}] EVAL not implemented yet (TODO).")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true", help="hit the served endpoint for live scoring")
+    ap.add_argument("--holdout", type=int, default=20, help="held-out examples to score")
+    ns = ap.parse_args(rest)
+    dataset_dir = sec.get("dataset_dir") or \
+        "/media/scott/SSD_4TB/finetune-staging/data/datasets"
+    train_jsonl = os.path.join(dataset_dir, "train.jsonl")
+    if not os.path.exists(train_jsonl):
+        sys.exit(f"[tiny.{name}] no dataset at {train_jsonl} (run `tiny-harness {name} train` first)")
+    examples = [json.loads(l) for l in open(train_jsonl) if l.strip()]
+    n = len(examples)
+    turns = [len(e.get("messages", [])) for e in examples]
+    est_tok = sum(sum(len(m.get("content",""))//4 for m in e.get("messages",[])) for e in examples)
+    p(f"[tiny.{name}] dataset: {n} examples, avg {sum(turns)/max(n,1):.1f} turns/ex, ~{est_tok} tokens")
+    if not ns.live:
+        p(f"[tiny.{name}] add --live to score the served endpoint on a {ns.holdout}-example holdout.")
+        sys.exit(0)
+    # live: hit base_url (or local serve) with held-out user prompts
+    import urllib.request
+    endpoint = sec.get("base_url") or f"http://{sec.get('host','127.0.0.1')}:{sec.get('port',8300)}/v1/chat/completions"
+    key = sec.get("api_key", "local"); mid = sec.get("model_id", name)
+    held = examples[-ns.holdout:]
+    ok = 0; tot = 0; errs = 0
+    for e in held:
+        msgs = e.get("messages", [])
+        ref = [m for m in msgs if m.get("role")=="assistant"]
+        if not ref: continue
+        ref_tok = set(ref[-1].get("content","").lower().split())
+        payload = json.dumps({"model": mid, "messages": msgs, "max_tokens": 256}).encode()
+        req = urllib.request.Request(endpoint, data=payload, headers={
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read())
+            gen = out["choices"][0]["message"]["content"].lower().split()
+            ov = len(ref_tok & set(gen)) / max(len(ref_tok), 1)
+            ok += ov; tot += 1
+        except Exception as ex:
+            errs += 1
+    if tot:
+        p(f"[tiny.{name}] live holdout ({tot} scored, {errs} errors): mean token-overlap vs reference = {ok/tot:.2f}")
+    else:
+        p(f"[tiny.{name}] no scoreable examples / endpoint down (errors={errs}).")
     sys.exit(0)
+
 else:
     sys.exit(f"unknown action: {action}  (serve|train|eval)")
 PY

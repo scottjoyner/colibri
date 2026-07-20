@@ -63,8 +63,9 @@ route_max_tokens = 256
 # (the helper may not accept "glm-5.2-colibri"). Set false to pass through as-is.
 rewrite_model_id = true
 
-# Example small-model harness (future). Disabled until a [tiny.<name>] model
-# exists locally or a base_url is set. Run: glm tiny-example | tiny-harness example serve
+# Example small-model harness. `tiny-example` is proxy-only for now (remote);
+# `tiny.coder` is a LOCAL, trainable example that drives the auto-finetune
+# pipeline (extract -> clean -> format -> train on opencode traces).
 [tiny.example]
 # model = "/path/to/small-finetune"   # local -> served via colibri-serve
 base_url = "http://helper-device.local:8300/v1"   # remote -> proxy only for now
@@ -72,6 +73,29 @@ model_id = "tiny-example"
 host = "127.0.0.1"
 port = 8300
 api_key = "local"
+
+# Trainable local harness. Fine-tune from a small base on opencode traces:
+#   tiny-harness coder train --plan          # show resolved plan
+#   tiny-harness coder train                 # prep (extract/clean/format) + dry-run train
+#   tiny-harness coder train --run           # prep + REAL QLoRA training (GPU box)
+#   tiny-harness coder serve                 # serve the resulting checkpoint
+#   tiny-harness coder eval --live           # score held-out traces vs reference
+[tiny.coder]
+# model = "/media/scott/SSD_4TB/finetune-staging/outputs/checkpoints/tiny-coder"
+model_id = "tiny-coder"
+host = "127.0.0.1"
+port = 8310
+api_key = "local"
+# training: drives the auto-finetune repo (default path below)
+train_repo   = "/home/scott/git/auto-finetune"
+train_base   = "/media/scott/SSD_4TB/models-fast/RefinedNeuro/RefinedToolCallV5-3b"
+train_output = "/media/scott/SSD_4TB/finetune-staging/outputs/checkpoints/tiny-coder"
+train_epochs = 2
+train_source = "opencode"   # opencode | hermes | null(merged)
+# optional per-subagent overrides (else inherited from auto-finetune config.yaml):
+# train_backend = "peft"     # auto | unsloth | peft
+# lora_r = 16; lora_alpha = 32; max_seq_length = 8192
+# system_prompt = ""         # override the format template's system prompt
 
 # Hermes adapter: how Hermes-agent should talk to our helper endpoint.
 # Hermes speaks OpenAI-compatible via provider:"custom" + base_url. `glm hermes

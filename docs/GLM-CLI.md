@@ -25,11 +25,11 @@ glm route "<prompt>"   # dry-run: print which backend a request would hit
   `provider:"custom"` + `base_url`; `glm hermes config` emits the exact
   `cli-config.yaml` `[model]` block to drop into Hermes so it routes through
   the helper. `glm hermes check` verifies the endpoint.
-- **Tier 3 — self-contained harness** `[harness]` + `[tiny.<name>]`: a small
-  orchestrator LM that decomposes a task into subtasks and fans them out to
-  subagents (each a `tiny.<name>` endpoint) in parallel, then synthesizes.
-  `glm harness "<task>"` runs the loop. `scripts/tiny-harness <name>
-  [serve|train|eval]` is the per-subagent skeleton.
+ - **Tier 3 — self-contained harness** `[harness]` + `[tiny.<name>]`: a small
+   orchestrator LM that decomposes a task into subtasks and fans them out to
+   subagents (each a `tiny.<name>` endpoint) in parallel, then synthesizes.
+   `glm harness "<task>"` runs the loop. `scripts/tiny-harness <name>
+   [serve|train|eval]` builds/serves/evaluates each subagent.
 
 ## Roles
 
@@ -38,12 +38,20 @@ glm route "<prompt>"   # dry-run: print which backend a request would hit
 - **hermes** → `[hermes]` (or `[helper]`): the smaller fine-tuned LM on
   another device. `glm hermes` queries/health-checks it; `glm hermes chat`
   proxies a completion; `glm hermes config` writes the Hermes adapter block.
-- **tiny-`<name>`** → `[tiny.<name>]` section: future small local harnesses
-  (e.g. a traced-finetune eval loop). Same local-serve / remote-proxy pattern;
-  add the section when the harness exists. `scripts/tiny-harness <name>
-  [serve|train|eval]` is the harness skeleton (serve wired; train/eval TODO).
-- **harness** → `[harness]` section: orchestrator endpoint + subagent list.
-  `glm harness` runs plan → parallel fan-out → synthesize.
+ - **tiny-`<name>`** → `[tiny.<name>]` section: a small local harness fine-tuned
+   on opencode traces. `scripts/tiny-harness <name>` builds/serves/evaluates it:
+   - `serve` — launch a local OpenAI-compatible server (via `colibri-serve`).
+   - `train` — drive the **auto-finetune** pipeline (extract → clean → format →
+     train) on opencode session traces, scoped per-subagent via `[tiny.<name>]`
+     training knobs (`train_repo`, `train_base`, `train_output`, `train_epochs`,
+     `train_source`, optional `lora_*`/`max_seq_length`/`system_prompt` overrides).
+     Flags: `--plan` (show resolved plan only), `--run` (real QLoRA training;
+     default is prep + dry-run train), `--skip-prep`, `--max-examples=N`,
+     `--epochs=N`, `--base=PATH`, `--output=DIR`, `--source=SRC`.
+   - `eval` — report held-out dataset stats; add `--live` to score the served
+     endpoint against reference assistant turns (token-overlap).
+ - **harness** → `[harness]` section: orchestrator endpoint + subagent list.
+   `glm harness` runs plan → parallel fan-out → synthesize.
 
 ## Proxy (token-budget routing)
 

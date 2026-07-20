@@ -157,7 +157,7 @@ def resolve_role(cfg, role):
         return "hermes", sec, "model" in sec
     if role.startswith("tiny-"):
         name = role[len("tiny-"):]
-        sec = cfg.get(f"tiny.{name}")
+        sec = cfg.get("tiny", {}).get(name)
         if not sec:
             sys.exit(f"no [tiny.{name}] section in config (tiny harness not built yet)")
         return role, sec, "model" in sec
@@ -356,7 +356,7 @@ def run_harness(cfg, task):
     def run_sub(sub):
         name = sub.get("subagent", subs[0] if subs else "example")
         stext = sub.get("task", task)
-        sec = cfg.get(f"tiny.{name}")
+        sec = cfg.get("tiny", {}).get(name)
         if not sec or not sec.get("base_url"):
             return name, f"[no [tiny.{name}] endpoint configured]"
         try:
