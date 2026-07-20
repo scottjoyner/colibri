@@ -31,6 +31,9 @@
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
 #endif
+#if defined(__linux__)
+#include <openssl/sha.h>                           /* KV cache DB: hash-keyed prefix lookup */
+#endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -3946,14 +3949,41 @@ static void kv_bind(Model *m, KVState *k){
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
+/* KV CACHE DB (definita piu' avanti): dichiarazioni in anticipo perche'
+ * step() le usa. g_kvdb* sono i flag/globali condivisi. */
+extern int g_kvdb;
+extern char g_kvdb_dir[2048];
+extern float *g_kvdb_xlast;
+extern int g_kvdb_xlen;
+static int  kvdb_load(Model *m, const int *ids, int S);
+static void kvdb_save(Model *m, const int *ids, int n, const float *xlast);
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
-    float *x=falloc((int64_t)S*D);
-    for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,S,pos_base);
-    if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
-    if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
-    float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
+    /* KV CACHE DB: se il prompt [0..S-1] inizia con un prefisso gia' salvato,
+     * kvdb_load lo carica in m->kv e ritorna P (n.token matchati). Se P==S e'
+     * un HIT TOTALE: l'hidden dell'ultima pos e' in g_kvdb_xlast -> saltiamo
+     * TUTTO il forward (zero prefill). Se 0<P<S prefilliamo solo ids[P..S-1]
+     * con pos_base=P (saltati P layer-forward). Lossless. */
+    int P=0;
+    if(g_kvdb && pos_base==0) P=kvdb_load(m, ids, S);
+    float *last=falloc(D);
+    if(g_kvdb_xlast && g_kvdb_xlen==D && P==S){
+        /* HIT TOTALE: salta il forward, usa l'hidden memorizzato. */
+        memcpy(last, g_kvdb_xlast, D*sizeof(float));
+        if(m->hlast) memcpy(m->hlast, last, D*sizeof(float));
+    } else {
+        int Sf=S-P;                               /* token da forward-are davvero */
+        float *x=falloc((int64_t)Sf*D);
+        for(int s=0;s<Sf;s++) embed_row(m, ids[P+s], x+(int64_t)s*D);
+        layers_forward(m,x,Sf,P);
+        if(m->hlast) memcpy(m->hlast, x+(int64_t)(Sf-1)*D, D*sizeof(float));
+        if(m->has_mtp && Sf>=2 && g_draft>0) mtp_absorb(m, ids+P+1, x, Sf-1, P);
+        /* KV CACHE DB: salva l'INTERO prompt + hidden ultima pos per il futuro. */
+        if(g_kvdb && pos_base==0) kvdb_save(m, ids, S, x+(int64_t)(Sf-1)*D);
+        memcpy(last, x+(int64_t)(Sf-1)*D, D*sizeof(float));
+        free(x);
+    }
+    rmsnorm(last, last, m->final_norm, D, c->eps);
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
     m->t_head += now_s()-th0;
@@ -3964,7 +3994,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
         for(int k=0;k<5;k++) fprintf(stderr," %d=%.3f",top[k],tv[k]);
         fprintf(stderr,"\n");
     }
-    free(x); free(last); return logit;
+    free(last); return logit;
 }
 
 /* come step(), ma ritorna i logits di TUTTE le S posizioni [S,vocab] (per la verifica spec) */
@@ -4518,6 +4548,55 @@ static void profile_reset(Model *m){
     m->t_aproj=m->t_acore=m->t_aout=0;
 }
 
+/* PREFILL_BENCH=N: misura il throughput di PREFILL (forward completo del
+ * contesto, nessuna generazione) su un prompt sintetico di N token. E' il
+ * costo che domina i turni opencode con system-prompt + context lunghi, e che
+ * il KV cache DB (KVDB=1) azera sui prefissi gia' visti. Ripete un filler finche'
+ * non raggiunge N token, prepone [gMASK]<sop> se modello GLM. Se KVDB=1 e il
+ * prompt e' gia' in cache, la seconda chiamata misura il solo HIT (load disco). */
+static void run_prefill_bench(Model *m, const char *snap, int N){
+    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    Tok T; tok_load(&T,tkp);
+    int pfx[2]={-1,-1}, pfx_on=0;
+    if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
+        char *ar=NULL; jval *r=cfg_root(snap,&ar); jval *mt=json_get(r,"model_type");
+        if(mt_is_glm(mt?mt->str:NULL)){
+            pfx[0]=tok_id_of(&T,"[gMASK]"); pfx[1]=tok_id_of(&T,"<sop>");
+            if(pfx[0]>=0&&pfx[1]>=0) pfx_on=1;
+        }
+        free(ar);
+    }
+    const char *filler = getenv("PREFILL_TEXT") ? getenv("PREFILL_TEXT")
+                          : "The quick brown fox jumps over the lazy dog. ";
+    int cap = N*4 + 16; int *ids = malloc(cap*sizeof(int));
+    int n=0;
+    if(pfx_on){ ids[0]=pfx[0]; ids[1]=pfx[1]; n=2; }
+    const char *realp = getenv("PREFILL_PROMPT");
+    if(realp){
+        int got=tok_encode(&T,realp,(int)strlen(realp),ids+n,cap-n);
+        if(got>0) n+=got;
+    } else {
+    while(n<N){
+        int room=cap-n; if(room<8) break;
+        int got=tok_encode(&T,filler,(int)strlen(filler),ids+n,room);
+        if(got<1) break;
+        n+=got;
+    }
+    }
+    if(n<1){ fprintf(stderr,"prefill bench: empty prompt\n"); free(ids); return; }
+    fprintf(stderr,"[PREFILL-BENCH] %d token, KVDB=%d\n", n, g_kvdb);
+    kv_alloc(m, n+2);
+    profile_reset(m);
+    double t0=now_s();
+    float *logit=step(m,ids,n,0); free(logit);
+    double dt=now_s()-t0;
+    double tot=m->hits+m->miss;
+    printf("PREFILL: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
+        n, dt, n/dt, tot?100.0*m->hits/tot:0.0);
+    profile_print(m,dt);
+    free(ids);
+}
+
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
  * replay the oracle sequence one token at a time. CPU and CUDA therefore see
  * identical hidden-state inputs even if their argmax predictions differ. */
@@ -4914,6 +4993,151 @@ out:
     }
     k->disk_nrec=nrec;
     return nrec;
+}
+
+/* ---- KV CACHE DB: store globale hash-keyed su disco (KVDB=1) ----
+ * A differenza di .coli_kv (una cache per sessione/append-only), qui piu'
+ * processi/invocazioni CONDIVIDONO i prefill: lo sha256 dei token del prompt
+ * e' la chiave. Un glm lanciato da opencode con lo stesso system-prompt +
+ * scaffolding riusa la KV gia' calcolata da un'altra chiamata -> ZERO prefill,
+ * nessun server residente. Ideale per il loop opencode: il prefisso e'
+ * identico tra le chiamate. Formato:
+ *   <snap>/.coli_kvdb/index.tsv   "<sha64> <ntok> <bytes>\n"
+ *   <snap>/.coli_kvdb/kv.<sha16>  blob impacchettato [rec per posizione]
+ * Ogni rec = [Lc kv_lora][Rc qk_rope] per layer (+[Ic index_hd] se DSA),
+ * IDENTICO al layout di kv_rec_bytes(). Il match e' ESATTO sul numero di token
+ * (prefill contiguo da pos 0) -> lossless, nessun rischio di KV spurio. */
+int g_kvdb=0;
+char g_kvdb_dir[2048];
+float *g_kvdb_xlast=NULL;        /* hidden dell'ultima pos, per HIT totale (salta il forward) */
+int g_kvdb_xlen=0;
+static int  kvdb_load(Model *m, const int *ids, int S);
+static void kvdb_save(Model *m, const int *ids, int n, const float *xlast);
+
+static void kvdb_path(const char *snap){
+    snprintf(g_kvdb_dir,sizeof(g_kvdb_dir),"%s/.coli_kvdb",snap);
+    /* crea la dir una volta (evita system() per-call e race) */
+    char dm[2048]; snprintf(dm,sizeof(dm),"%s",g_kvdb_dir);
+    for(char *p=dm+1;*p;p++) if(*p=='/'){ *p=0; mkdir(dm,0755); *p='/'; }
+    mkdir(dm,0755);
+}
+static int64_t kvdb_rec_bytes(Model *m){
+    Cfg *c=&m->c;
+    int64_t rec=(int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
+    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i])
+        rec+=(int64_t)c->index_hd*4;
+    return rec;
+}
+/* Calcola lo sha256 esadecimale (64 char) dell'array di token ids[0..n-1]. */
+static void kvdb_sha(const int *ids, int n, char *out64){
+    unsigned char dg[SHA256_DIGEST_LENGTH];
+#if defined(__linux__)
+    SHA256_CTX ctx; SHA256_Init(&ctx);
+    SHA256_Update(&ctx, ids, (size_t)n*sizeof(int));
+    SHA256_Final(dg, &ctx);
+#else
+    (void)ids;(void)n; memset(dg,0,sizeof(dg));
+#endif
+    static const char *hx="0123456789abcdef";
+    for(int i=0;i<SHA256_DIGEST_LENGTH;i++){ out64[2*i]=hx[dg[i]>>4]; out64[2*i+1]=hx[dg[i]&15]; }
+    out64[64]=0;
+}
+/* Cerca ids[0..S-1] nel DB. Il DB contiene prefissi calcolati in passato:
+ * se trova uno sha esatto di un prefisso ids[0..P-1] (P<=S), copia le righe
+ * KV di quei P token in m->kv e ritorna P (il chiamante prefilla SOLO i token
+ * nuovi ids[P..S-1] con pos_base=P: l'attention li aggancia al prefisso
+ * gia' calcolato). Se nessun prefisso matcha ritorna 0 (prefill da 0).
+ * Nota: il forward dell'hidden x dei token prefissi NON si puo' saltare
+ * (la KV compressa non lo ricostruisce), ma si saltano P layer-forward. */
+static int kvdb_load(Model *m, const int *ids, int S){
+    if(!g_kvdb || S<1) return 0;
+    Cfg *c=&m->c; int64_t rec=kvdb_rec_bytes(m);
+    g_kvdb_xlen=0;     /* reset segnale HIT totale (forza re-read in caso di match) */
+    /* prova prefissi decrescenti: match sul prefisso piu' lungo disponibile. */
+    for(int P=S; P>=1; P--){
+        char sha[65]; kvdb_sha(ids,P,sha);
+        char idx[2200]; snprintf(idx,sizeof(idx),"%s/index.tsv",g_kvdb_dir);
+        FILE *f=fopen(idx,"r"); if(!f) return 0;
+        char line[512]; int found=0; long bytes=0;
+        while(fgets(line,sizeof(line),f)){
+            if(strncmp(line,sha,64)) continue;
+            long nt=0, by=0;
+            if(sscanf(line+64," %ld %ld",&nt,&by)!=2) continue;
+            if(nt!=P) break;
+            found=1; bytes=by; break;
+        }
+        fclose(f);
+        if(!found) continue;
+        char blob[2200]; snprintf(blob,sizeof(blob),"%s/kv.%s",
+            g_kvdb_dir,sha);
+        FILE *b=fopen(blob,"rb"); if(!b) return 0;
+        if(bytes < (long)(P*rec + c->hidden*4)){ fclose(b); continue; }
+        double t0=now_s();
+        uint8_t *buf=malloc((size_t)rec);
+        if(!buf){ fclose(b); return 0; }
+        for(int p=0;p<P;p++){
+            if(fread(buf,1,(size_t)rec,b)!=(size_t)rec){ free(buf); fclose(b); return 0; }
+            const uint8_t *q=buf;
+            for(int i=0;i<c->n_layers;i++){
+                memcpy(m->Lc[i]+(int64_t)p*c->kv_lora, q, (size_t)c->kv_lora*4); q+=c->kv_lora*4;
+                memcpy(m->Rc[i]+(int64_t)p*c->qk_rope,q, (size_t)c->qk_rope*4); q+=c->qk_rope*4;
+            }
+            if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]){
+                memcpy(m->Ic[i]+(int64_t)p*c->index_hd, q, (size_t)c->index_hd*4); q+=c->index_hd*4;
+            }
+        }
+        /* HIT TOTALE: leggi l'hidden dell'ultima pos e segnalo al chiamante. */
+        if(P==S){
+            if(!g_kvdb_xlast || g_kvdb_xlen!=c->hidden){
+                free(g_kvdb_xlast); g_kvdb_xlast=falloc((int64_t)c->hidden); g_kvdb_xlen=c->hidden;
+            }
+            if(fread(g_kvdb_xlast,4,(size_t)c->hidden,b)!=(size_t)c->hidden){ free(buf); fclose(b); return 0; }
+        }
+        free(buf); fclose(b);
+        if(m->has_mtp) m->kv_start[c->n_layers]=-1;
+        fprintf(stderr,"[KVDB] HIT sha=%c%c%c%c%c%c%c%c prefix=%d/%d in %.1fms%s\n",
+            sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],P,S,(now_s()-t0)*1e3,
+            P==S?" (FORWARD COMPLETO SALTATO)":"");
+        return P;
+    }
+    return 0;
+}
+/* Salva ids[0..n-1] nel DB: le righe KV + l'hidden dell'ultima pos (xlast).
+ * xlast va passato dal chiamante DOPO il forward reale. */
+static void kvdb_save(Model *m, const int *ids, int n, const float *xlast){
+    if(!g_kvdb || n<1) return;
+    char sha[65]; kvdb_sha(ids,n,sha);
+    char idx[2200]; snprintf(idx,sizeof(idx),"%s/index.tsv",g_kvdb_dir);
+    /* evita duplicati: se lo sha c'e' gia', skip */
+    FILE *f=fopen(idx,"r");
+    if(f){ char line[512];
+        while(fgets(line,sizeof(line),f)) if(!strncmp(line,sha,64)){ fclose(f); return; }
+        fclose(f);
+    }
+    /* la dir e' gia' stata creata da kvdb_path() all'avvio */
+    Cfg *c=&m->c; int64_t rec=kvdb_rec_bytes(m); long bytes=(long)(n*rec + c->hidden*4);
+    char blob[2200]; snprintf(blob,sizeof(blob),"%s/kv.%s",
+        g_kvdb_dir,sha);
+    FILE *b=fopen(blob,"wb"); if(!b) return;
+    uint8_t *buf=malloc((size_t)rec);
+    if(!buf){ fclose(b); return; }
+    for(int p=0;p<n;p++){
+        uint8_t *q=buf;
+        for(int i=0;i<c->n_layers;i++){
+            memcpy(q, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); q+=c->kv_lora*4;
+            memcpy(q, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); q+=c->qk_rope*4;
+        }
+        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]){
+            memcpy(q, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); q+=c->index_hd*4;
+        }
+        fwrite(buf,1,(size_t)rec,b);
+    }
+    free(buf);
+    if(xlast) fwrite(xlast,4,(size_t)c->hidden,b);   /* hidden ultima pos */
+    fclose(b);
+    FILE *af=fopen(idx,"a"); if(af){ fprintf(af,"%s %d %ld\n",sha,n,bytes); fclose(af); }
+    fprintf(stderr,"[KVDB] SAVE sha=%c%c%c%c%c%c%c%c ntok=%d bytes=%ld\n",
+        sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],n,bytes);
 }
 
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
@@ -5884,6 +6108,68 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
 }
 
+/* WARM CACHE: prime della LRU cross-process (WARM=1). Un glm lanciato da opencode
+ * e' un processo NUOVO: la sua LRU parte vuota, quindi i primi token pagano la
+ * latenza di miss-disco per gli expert "caldi" che il processo PRECEDENTE usava
+ * gia'. Qui, dopo cap_for_ram, carichiamo in RAM i top-expert per frequenza
+ * (m->eusage, gia' accumulato in .coli_usage dalle run passate) entro un budget
+ * RAM, inserendoli nella LRU ecache[] come hit residenti. E' l'analogo del KV
+ * cache DB ma per gli expert: il primo prefill di una chiamata fresh non paga
+ * i miss. Non pinniamo (restano evictable dalla LRU adattiva), solo pre-riscaldi.
+ * WARM_GB=n: budget esplicito; default = meta' del budget expert disponibile. */
+static void warm_prime(Model *m, double warm_gb){
+    Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,m->ebits);
+    if(eb<=0) return;
+    int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
+    if(m->has_mtp) nsp+=2;                         /* riga MTP conta ~doppia */
+    if(nsp<1) return;
+    int cap=(c->n_layers+1)*c->n_experts;
+    /* raccogli (layer,expert,freq) da eusage */
+    typedef struct { int l,e; uint32_t u; } WRec;
+    WRec *r=malloc((size_t)cap*sizeof(WRec)); int n=0;
+    for(int l=0;l<=c->n_layers;l++){
+        int sparse=(l<c->n_layers&&m->L[l].sparse)||(l==c->n_layers&&m->has_mtp);
+        if(!sparse||!m->eusage[l]) continue;
+        for(int e=0;e<c->n_experts;e++)
+            if(m->eusage[l][e]>0) r[n++]=(WRec){l,e,m->eusage[l][e]};
+    }
+    if(n==0){ free(r); return; }
+    int cmpW(const void*a,const void*b){ const WRec*x=a,*y=b;
+        if(y->u!=x->u) return (y->u>x->u)?1:-1; return x->l-y->l; }
+    qsort(r,(size_t)n,sizeof(*r),cmpW);
+    /* budget: NON può superare la capacità reale della LRU (cap*nsp expert),
+     * altrimenti si spreca RAM fuori cache. Default = meta della LRU (cap/2 a
+     * layer), WARM_GB=n lo fissa esplicitamente (sempre clampato a cap*nsp). */
+    int64_t lru_cap_bytes=(int64_t)m->ecap*nsp*eb;
+    int64_t budget_b;
+    if(warm_gb>0) budget_b=(int64_t)(warm_gb*1e9);
+    else budget_b=lru_cap_bytes/2;
+    if(budget_b>lru_cap_bytes) budget_b=lru_cap_bytes;
+    /* inserimento SERIALIZZATO per layer: ecn[l] e' condiviso, senza lock le
+     * Race OMP sovrascrivono lo stesso slot e caricano oltre cap (corruzione). */
+    static pthread_mutex_t g_warm_mx=PTHREAD_MUTEX_INITIALIZER;
+    int loaded=0; int64_t used_b=0; double t0=now_s();
+    for(int a=0;a<n;a++){
+        if(used_b + eb > budget_b) break;          /* gia' al budget */
+        int l=r[a].l, e=r[a].e;
+        pthread_mutex_lock(&g_warm_mx);
+        if(m->ecn[l] >= m->ecap){ pthread_mutex_unlock(&g_warm_mx); continue; }
+        int slot=m->ecn[l]++;                        /* assegnazione atomica di slot */
+        pthread_mutex_unlock(&g_warm_mx);
+        ESlot *s=&m->ecache[l][slot];
+        int rc=expert_load(m,l,e,s,0);               /* non-fatale: slot hidden se OOM */
+        if(rc!=0){                                   /* fallita: libera lo slot */
+            pthread_mutex_lock(&g_warm_mx); if(m->ecn[l]>slot) m->ecn[l]=slot;
+            pthread_mutex_unlock(&g_warm_mx); continue;
+        }
+        loaded++; used_b+=eb;
+    }
+    m->resident_bytes += used_b;
+    fprintf(stderr,"[WARM] primed %d expert into LRU from .coli_usage in %.1fs (%.2f GB, cap=%d/layer, budget %.2f GB)\n",
+        loaded, now_s()-t0, used_b/1e9, m->ecap, budget_b/1e9);
+    free(r);
+}
+
 /* The user's generation prompt. COLI_PROMPT is honored on every platform; a bare
  * PROMPT is honored too, EXCEPT on Windows, where cmd.exe always exports its own
  * PROMPT template (default "$P$G", the thing that draws "C:\...>") into the child's
@@ -6207,11 +6493,28 @@ int main(int argc, char **argv){
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
-      cap_for_ram(&m, ram_env, ebits, est_ctx); }
+       cap_for_ram(&m, ram_env, ebits, est_ctx); }
+    /* WARM CACHE: prime della LRU cross-process dagli expert "caldi" di .coli_usage.
+     * Salta i miss-disco dei primi token di un processo fresh (opencode). */
+    if(getenv("WARM") && atoi(getenv("WARM")))
+        warm_prime(&m, getenv("WARM_GB")?atof(getenv("WARM_GB")):0.0);
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
+
+    /* KV CACHE DB globale (condivisa tra processi/invocazioni) */
+    g_kvdb = getenv("KVDB")?atoi(getenv("KVDB")):0;
+    if(g_kvdb) kvdb_path(snap);
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
     if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
+
+    /* benchmark di prefill: PREFILL_BENCH=N token (vedi run_prefill_bench) */
+    if(getenv("PREFILL_BENCH")){
+        int N=atoi(getenv("PREFILL_BENCH"));
+        if(N<1) N=512;
+        run_prefill_bench(&m, snap, N);
+        if(stats) stats_dump(&m,stats);
+        return 0;
+    }
 
     /* modo serve persistente per la CLI 'coli': SERVE=1 */
     if(getenv("SERVE")){
