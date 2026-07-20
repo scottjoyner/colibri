@@ -193,6 +193,37 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
+    # KV cache DB: hash-keyed prefill cache shared across processes/slots.
+    # Opencode's system prompt is identical every call -> the first request of
+    # each conversation pays prefill once, every later call (and every new
+    # conversation sharing the same prompt) hits the cache (-> ~14k tok/s prefill).
+    # Opt-out: --no-kvdb or COLI_KVDB=0. (WARM=1 also primes the LRU from the
+    # historical .coli_usage hot set; measured marginal, opt-in only.)
+    if os.environ.get("COLI_KVDB", "1") != "0" and not getattr(a, "no_kvdb", False):
+        e.setdefault("KVDB", "1")
+        # HOT RAM layer: in-process KV cache in front of SSD. Sized by KVHOT_GB
+        # (default 0.5 GB ~ hundreds of prompts). Holds the system prompts we
+        # hotswap between sessions so a new conversation is a memcpy, not a prefill.
+        if os.environ.get("COLI_KVHOT_GB"):
+            e["KVHOT_GB"]=os.environ["COLI_KVHOT_GB"]
+        elif getattr(a, "kvhot_gb", None):
+            e["KVHOT_GB"]=str(a.kvhot_gb)
+        else:
+            e.setdefault("KVHOT_GB", "0.5")
+    # Cache-stable normalization: rewrite volatile tokens (timestamp/date/cwd/
+    # path/key=value) so the KVDB sha matches across sessions even when opencode
+    # injects a fresh timestamp or cwd. Opt-in: --kvdb-normalize or COLI_KVDB_NORMALIZE=1.
+    if os.environ.get("COLI_KVDB_NORMALIZE", "0") == "1" or getattr(a, "kvdb_normalize", False):
+        e["KVDB_NORMALIZE"] = "1"
+    if os.environ.get("COLI_WARM", "0") == "1" or getattr(a, "warm", False):
+        e["WARM"] = "1"
+    # Prewarm the HOT RAM + SSD cache from a file/dir of prompts (Hermes/opencode).
+    # Done inside the glm process so the primissima richiesta e' free.
+    prime=getattr(a, "kvdb_prime", None) or os.environ.get("COLI_KVDB_PRIME")
+    if prime:
+        e["KVDB_PRIME"]=prime
+        if getattr(a, "kvdb_prime_only", False):
+            e["KVDB_PRIME_ONLY"]="1"
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -629,6 +660,20 @@ def cmd_serve(a):
           a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
           a.max_queue,a.queue_timeout,a.kv_slots)
 
+def cmd_kvdb_prime(a):
+    """Prewarm the HOT RAM + SSD KV cache from a file/dir of prompts (Hermes/
+    opencode system prompts), then exit. The engine computes each prefill once,
+    saves it to SSD (.coli_kvdb/) AND promotes it into the in-process HOT RAM
+    tier, so the first real request after `coli serve` is a free memcpy."""
+    need_model(a.model)
+    a.kvdb_prime = a.path
+    a.kvdb_prime_only = True
+    e = env_for(a)
+    banner("kvdb-prime")
+    print(f"  prewarming KV cache from: {C.cyan}{a.path}{C.r}")
+    print(f"  HOT RAM budget: {e.get('KVHOT_GB','0.5')} GB  ·  model: {a.model}")
+    sys.exit(subprocess.call([GLM], env=e))
+
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
     need_model(a.model)
@@ -714,9 +759,17 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
+    common.add_argument("--no-kvdb", action="store_true", help="disable the global hash-keyed KV cache DB (COLI_KVDB=0)")
+    common.add_argument("--warm", action="store_true", help="prime the expert LRU from historical .coli_usage (COLI_WARM=1)")
+    common.add_argument("--kvdb-prime", metavar="PATH", help="prewarm the HOT RAM + SSD KV cache from a file/dir of prompts (Hermes/opencode) before serving")
+    common.add_argument("--kvdb-prime-only", action="store_true", help="only prime the KV cache then exit (don't serve)")
+    common.add_argument("--kvhot-gb", type=float, metavar="GB", help="size of the in-process HOT RAM KV cache (default 0.5 GB ~ hundreds of prompts)")
+    common.add_argument("--kvdb-normalize", action="store_true", help="normalize volatile tokens (timestamp/date/cwd/path) so the KV cache hits across sessions (COLI_KVDB_NORMALIZE=1)")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
+    pkv=sub.add_parser("kvdb-prime", parents=[common], help="prewarm the HOT RAM + SSD KV cache from a file/dir of prompts")
+    pkv.add_argument("path", help="file or directory of prompt files (.json/.md/.txt/.yaml/.yml)")
     pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
     pd=sub.add_parser("doctor",parents=[common])
@@ -755,7 +808,7 @@ def main():
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
-             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+             "convert":cmd_convert,"web":cmd_web,"kvdb-prime":cmd_kvdb_prime}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 

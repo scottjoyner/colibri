@@ -470,6 +470,7 @@ class Engine:
         self.kv_slots = kv_slots
         self.tiers = None
         self.hwinfo = None
+        self.last_stats = {}
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
@@ -482,7 +483,7 @@ class Engine:
     def _stats(fields):
         if len(fields) < 5 or fields[0] != "STAT":
             raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
-        return {
+        stats = {
             "completion_tokens": int(fields[1]),
             "tokens_per_second": float(fields[2]),
             "cache_hit_percent": float(fields[3]),
@@ -490,6 +491,22 @@ class Engine:
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
         }
+        # HOT RAM KV tier (kvdb=1 trailer): kvhot_n / kvhot_mb / kvhot_hits / kvhot_loads
+        kv = {}
+        for tok in fields[7:]:
+            if "=" in tok:
+                k, _, v = tok.partition("=")
+                try: kv[k] = float(v)
+                except ValueError: pass
+        if "kvhot_n" in kv:
+            stats["kv_cache_hot"] = {
+                "enabled": True,
+                "prompts": int(kv.get("kvhot_n", 0)),
+                "size_mb": kv.get("kvhot_mb", 0.0),
+                "hits": int(kv.get("kvhot_hits", 0)),
+                "promoted_from_ssd": int(kv.get("kvhot_loads", 0)),
+            }
+        return stats
 
     def _fail_pending(self, error):
         with self.pending_lock:
@@ -534,6 +551,7 @@ class Engine:
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    self.last_stats = stats
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
@@ -771,6 +789,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 if tiers: payload["tiers"] = tiers
                 hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                 if hwinfo: payload["hwinfo"] = hwinfo
+                hot = getattr(self.server.engine, "last_stats", {}).get("kv_cache_hot")
+                if hot: payload["kv_cache_hot"] = hot
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
