@@ -5001,343 +5001,696 @@ out:
  * e' la chiave. Un glm lanciato da opencode con lo stesso system-prompt +
  * scaffolding riusa la KV gia' calcolata da un'altra chiamata -> ZERO prefill,
  * nessun server residente. Ideale per il loop opencode: il prefisso e'
- * identico tra le chiamate. Formato:
- *   <snap>/.coli_kvdb/index.tsv   "<sha64> <ntok> <bytes>\n"
- *   <snap>/.coli_kvdb/kv.<sha16>  blob impacchettato [rec per posizione]
+ * identico tra le chiamate. Formato (blob self-describing, no external index):
+ *   <snap>/.coli_kvdb/kv.<sha64>  header(64B: magic 'COLI', version, model_id,
+ *                                   quant, hits, ctx, text_len, timestamps,
+ *                                   payload_bytes, ids_bytes) + text + ids[n] +
+ *                                   KV rows[n] (+hidden ultima pos). L'header rifiuta
+ *                                   un checkpoint di modello/quant diverso.
  * Ogni rec = [Lc kv_lora][Rc qk_rope] per layer (+[Ic index_hd] se DSA),
  * IDENTICO al layout di kv_rec_bytes(). Il match e' ESATTO sul numero di token
- * (prefill contiguo da pos 0) -> lossless, nessun rischio di KV spurio. */
+ * (prefill contiguo da pos 0) -> lossless, nessun rischio di KV spurio.
+ * La chiave e' lo sha256 dei token (o, se disponibile, del testo normalizzato
+ * del prompt) -> riuso anche con prefissi di testo parziali. */
 int g_kvdb=0;
 char g_kvdb_dir[2048];
 float *g_kvdb_xlast=NULL;        /* hidden dell'ultima pos, per HIT totale (salta il forward) */
 int g_kvdb_xlen=0;
-static int  kvdb_load(Model *m, const int *ids, int S);
-static void kvdb_save(Model *m, const int *ids, int n, const float *xlast);
 
-/* HOT RAM LAYER: cache KV in memoria entro il processo glm, davanti all'SSD.
- * Un "hotswap" di sessione = memcpy del blob caldo nel KVState del motore,
- * senza lettura disco ne ricalcolo. Capacita' in RAM (KVHOT_GB, default 0.5):
- * a ~2-4 MB/prompt ci stanno centinaia di prompt. LRU sugli inserimenti. */
+/* ds4-inspired hardening: self-describing blob (magic/version/model_id/quant/
+ * hits/timestamps) so a stale checkpoint from a different model/quant is refused,
+ * per-entry hit counting that drives eviction, a disk budget with hit-decay
+ * eviction (the SSD tier used to grow unbounded), and boundary trim/align on
+ * store so the cached KV exactly matches a cold prefill at the compressor
+ * boundary. Text-keyed prefix lookup (SHA of the normalized prompt text) is also
+ * supported when a caller supplies the prompt text + tokenizer. */
+static uint32_t g_kvdb_model_id=0;   /* fnv1a(snapshot): refuses cross-model reuse */
+static int g_kvdb_quant=4;           /* KVDB_QUANT (bits); guard against mixing quants */
+static int64_t g_kvdb_budget=0;      /* SSD budget bytes (KVDB_BUDGET_GB); 0 = unlimited */
+static int g_kvdb_align=2048;        /* store prefix aligned down to a multiple of this */
+static int g_kvdb_trim=32;           /* trim this many tail tokens before aligning */
+static int g_kvdb_min=1;
+static int g_kvdb_fp16=0;           /* KVDB_FP16: store KV as fp16 (halves disk/RAM) */
+static int g_kvdb_mmap=0;           /* KVDB_MMAP: HOT tier = mmap views of SSD files */             /* min tokens worth caching */
+/* text-keyed context: set by callers that hold the normalized prompt text +
+ * tokenizer. When NULL the cache falls back to pure token-id prefix matching. */
+static const char *g_kvdb_text=NULL;
+static int g_kvdb_text_len=0;
+static Tok *g_kvdb_T=NULL;
+
+static void kvdb_set_text(const char *t, int n, Tok *T){ g_kvdb_text=t; g_kvdb_text_len=n; g_kvdb_T=T; }
+static void kvdb_clear_text(void){ g_kvdb_text=NULL; g_kvdb_text_len=0; g_kvdb_T=NULL; }
+
+#define KVDB_HDR_SIZE 64
+#define KVDB_HALF_LIFE 86400LL   /* seconds; hit-decay half-life for eviction */
+
+static uint32_t fnv1a_str(const char *s){
+  uint32_t h=2166136261u;
+  for(;*s;s++){ h^=(unsigned char)*s; h*=16777619u; }
+  return h;
+}
+static void kvdb_le_u32(uint8_t *p, uint32_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
+static uint32_t kvdb_le_u32g(const uint8_t *p){ return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
+static void kvdb_le_i64(uint8_t *p, int64_t v){ for(int i=0;i<8;i++) p[i]=(uint8_t)(v>>(8*i)); }
+static int64_t kvdb_le_i64g(const uint8_t *p){ int64_t v=0; for(int i=0;i<8;i++) v|=(int64_t)p[i]<<(8*i); return v; }
+
+/* optional fp16 storage for the cached KV (KVDB_FP16): halves on-disk + HOT-RAM
+ * footprint. Lossy but a cache is recomputable; default off. */
+static unsigned short f32_to_f16(float v){
+  union { float f; unsigned int u; } x; x.f=v;
+  unsigned int ui=x.u; int s=(ui>>16)&0x8000; int e=(ui>>23)&0xff; int m=ui&0x7fffff;
+  if(e==255) return (unsigned short)(s|0x7c00|(m?0x200:0));
+  int ne=e-127+15;
+  if(ne>=0x1f) return (unsigned short)(s|0x7c00);
+  if(ne<=0){ if(ne<-10) return (unsigned short)s; m|=0x800000; int sh=14-ne; return (unsigned short)(s|(m>>sh)); }
+  return (unsigned short)(s|(ne<<10)|(m>>13));
+}
+/* f16_to_f32() is provided by st.h; we only add the float->f16 direction. */
+static uint8_t *kvdb_put_f16(uint8_t *q, const float *f, int64_t n){
+  for(int64_t i=0;i<n;i++){ unsigned short h=f32_to_f16(f[i]); q[0]=(uint8_t)(h&0xff); q[1]=(uint8_t)(h>>8); q+=2; }
+  return q;
+}
+static const uint8_t *kvdb_get_f16(const uint8_t *q, float *f, int64_t n){
+  for(int64_t i=0;i<n;i++){ unsigned short h=(unsigned short)q[0]|((unsigned short)q[1]<<8); f[i]=f16_to_f32(h); q+=2; }
+  return q;
+}
+static int kvdb_elsize(void){ return g_kvdb_fp16?2:4; }
+/* bytes of KV payload for n tokens at the storage precision */
+static int64_t kvdb_payload_bytes(Model *m, int n){
+  Cfg *c=&m->c; int es=kvdb_elsize();
+  int64_t per=(int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*es;
+  if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) per+=(int64_t)c->index_hd*es;
+  return (int64_t)n*per + (int64_t)c->hidden*es;
+}
+
+/* ---- HOT RAM LAYER: cache KV in memoria entro il processo glm, davanti all'SSD.
+ * Un "hotswap" di sessione = memcpy del blob caldo nel KVState del motore, senza
+ * lettura disco ne ricalcolo. Capacita' in RAM (KVHOT_GB, default 0.5): a ~2-4
+ * MB/prompt ci stanno centinaia di prompt. LRU sugli inserimenti.
+ * La ricerca e' indicizzata per hash (n,sha) -> O(1); con KVDB_MMAP=1 il tier
+ * diventa una VISTA mmap dei file SSD (page-cache condivisa, nessuna copia
+ * privata): un esperimento verso un DB KV overlay completamente in RAM. */
 #define KVHOT_MAX 4096
-typedef struct { char sha[65]; int n; int64_t bytes; uint8_t *buf; uint64_t last; uint64_t used; } KVHot;
+typedef struct { char sha[65]; int n; int64_t bytes; uint8_t *buf; uint64_t last; uint64_t used; uint32_t hits; int mapped; } KVHot;
 static KVHot g_kvhot[KVHOT_MAX];
 static int   g_kvhot_n=0;
 static int64_t g_kvhot_bytes=0;
-static int64_t g_kvhot_budget=512*1024*1024;   /* 0.5 GB default */
+static int64_t g_kvhot_budget=512*1024*1024;   /* KVHOT_GB default 0.5 */
 static uint64_t g_kvhot_clock=0;
-static uint64_t g_kvhot_hits=0;      /* HOT RAM tier serviti (swap free) */
-static uint64_t g_kvhot_loads=0;     /* promossi da SSD -> HOT */
-static void kvhot_evict_to_budget(void);   /* forward: usata da kvhot_put */
+static uint64_t g_kvhot_hits=0;
+static uint64_t g_kvhot_loads=0;
 
-static uint8_t *kvhot_get(const char *sha, int n){
-    for(int i=0;i<g_kvhot_n;i++)
-        if(g_kvhot[i].n==n && !memcmp(g_kvhot[i].sha,sha,64)){
-            g_kvhot[i].last=++g_kvhot_clock; g_kvhot[i].used++;
-            g_kvhot_hits++;
-            return g_kvhot[i].buf;
-        }
-    return NULL;
+/* hash index over (n,sha) -> O(1) HOT lookup. Open addressing + tombstones.
+ * Il slot dell'array viene sempre ri-verificato per (n,sha) alla lookup, quindi
+ * un'eventuale disallinea della mappa non puo' mai restituire un KV errato. */
+#define KVHOT_MAP 8192
+#define HOT_EMPTY -1
+#define HOT_TOMB  -2
+typedef struct { int slot; int n; char sha[65]; } HotEnt;
+static HotEnt g_kvhot_map[KVHOT_MAP];
+static int g_kvhot_map_inited=0;
+static uint32_t kvhot_hash(int n, const char *sha){
+  uint32_t h = 2166136261u ^ (uint32_t)(n*2654435761u);
+  for(int i=0;i<64;i+=4){ uint32_t v; memcpy(&v,sha+i,4); h^=v; h*=16777619u; }
+  return h;
 }
+static void kvhot_map_init(void){
+  if(g_kvhot_map_inited) return;
+  for(int i=0;i<KVHOT_MAP;i++){ g_kvhot_map[i].slot=HOT_EMPTY; g_kvhot_map[i].n=0; g_kvhot_map[i].sha[0]=0; }
+  g_kvhot_map_inited=1;
+}
+static int kvhot_map_find(int n, const char *sha){
+  kvhot_map_init();
+  uint32_t h = kvhot_hash(n,sha) & (KVHOT_MAP-1);
+  for(int i=0;i<KVHOT_MAP;i++){
+    int idx=(h+i)&(KVHOT_MAP-1);
+    int s=g_kvhot_map[idx].slot;
+    if(s==HOT_EMPTY) return -1;
+    if(s==HOT_TOMB) continue;
+    if(g_kvhot_map[idx].n==n && !memcmp(g_kvhot_map[idx].sha,sha,64)) return s;
+  }
+  return -1;
+}
+static void kvhot_map_insert(int n, const char *sha, int slot){
+  kvhot_map_init();
+  uint32_t h = kvhot_hash(n,sha) & (KVHOT_MAP-1);
+  int tomb=-1;
+  for(int i=0;i<KVHOT_MAP;i++){
+    int idx=(h+i)&(KVHOT_MAP-1);
+    int s=g_kvhot_map[idx].slot;
+    if(s>=0){ if(g_kvhot_map[idx].n==n && !memcmp(g_kvhot_map[idx].sha,sha,64)){ g_kvhot_map[idx].slot=slot; return; } continue; }
+    if(s==HOT_TOMB && tomb<0) tomb=idx;
+    if(s==HOT_EMPTY){ int use=(tomb>=0)?tomb:idx;
+      g_kvhot_map[use].slot=slot; g_kvhot_map[use].n=n; memcpy(g_kvhot_map[use].sha,sha,64); return; }
+  }
+  if(tomb>=0){ g_kvhot_map[tomb].slot=slot; g_kvhot_map[tomb].n=n; memcpy(g_kvhot_map[tomb].sha,sha,64); }
+}
+static void kvhot_map_remove(int n, const char *sha){
+  kvhot_map_init();
+  uint32_t h = kvhot_hash(n,sha) & (KVHOT_MAP-1);
+  for(int i=0;i<KVHOT_MAP;i++){
+    int idx=(h+i)&(KVHOT_MAP-1);
+    int s=g_kvhot_map[idx].slot;
+    if(s==HOT_EMPTY) return;
+    if(s==HOT_TOMB) continue;
+    if(g_kvhot_map[idx].n==n && !memcmp(g_kvhot_map[idx].sha,sha,64)){ g_kvhot_map[idx].slot=HOT_TOMB; return; }
+  }
+}
+static void kvhot_map_reslot(int n, const char *sha, int newslot){
+  kvhot_map_init();
+  uint32_t h = kvhot_hash(n,sha) & (KVHOT_MAP-1);
+  for(int i=0;i<KVHOT_MAP;i++){
+    int idx=(h+i)&(KVHOT_MAP-1);
+    int s=g_kvhot_map[idx].slot;
+    if(s==HOT_EMPTY) return;
+    if(s==HOT_TOMB) continue;
+    if(g_kvhot_map[idx].n==n && !memcmp(g_kvhot_map[idx].sha,sha,64)){ g_kvhot_map[idx].slot=newslot; return; }
+  }
+}
+static void kvhot_entry_free(KVHot *h){
+  if(h->buf){ if(h->mapped) munmap(h->buf,(size_t)h->bytes); else free(h->buf); h->buf=NULL; }
+  h->bytes=0; h->mapped=0;
+}
+static void kvhot_evict_to_budget(void);
+static int kvhot_make_room(void){
+  if(g_kvhot_n<KVHOT_MAX) return g_kvhot_n++;
+  int lr=0; for(int i=1;i<g_kvhot_n;i++) if(g_kvhot[i].last<g_kvhot[lr].last) lr=i;
+  kvhot_map_remove(g_kvhot[lr].n, g_kvhot[lr].sha);
+  kvhot_entry_free(&g_kvhot[lr]);
+  g_kvhot[lr]=g_kvhot[--g_kvhot_n];
+  if(g_kvhot_n>0) kvhot_map_reslot(g_kvhot[lr].n, g_kvhot[lr].sha, lr);
+  return lr;
+}
+static uint8_t *kvhot_get(const char *sha, int n){
+  int slot=kvhot_map_find(n,sha);
+  if(slot>=0 && g_kvhot[slot].n==n && !memcmp(g_kvhot[slot].sha,sha,64)){
+    g_kvhot[slot].last=++g_kvhot_clock; g_kvhot[slot].used++; g_kvhot_hits++; return g_kvhot[slot].buf;
+  }
+  return NULL;
+}
+/* private copy (usato da kvdb_save per un blob gia' in RAM) */
 static void kvhot_put(const char *sha, int n, const uint8_t *src, int64_t bytes){
-    /* trova slot: esistente, oppure LRU (min last) se pieno */
-    int slot=-1;
-    for(int i=0;i<g_kvhot_n;i++) if(g_kvhot[i].n==n && !memcmp(g_kvhot[i].sha,sha,64)){ slot=i; break; }
-    if(slot<0){
-        if(g_kvhot_n<KVHOT_MAX) slot=g_kvhot_n++;
-        else { int lr=0; for(int i=1;i<g_kvhot_n;i++) if(g_kvhot[i].last<g_kvhot[lr].last) lr=i; slot=lr; }
-    }
-    KVHot *h=&g_kvhot[slot];
-    if(h->buf){ g_kvhot_bytes-=h->bytes; free(h->buf); h->buf=NULL; h->bytes=0; }
-    h->buf=malloc((size_t)bytes);
-    if(!h->buf) return;                         /* OOM: skip hot, SSD resta valido */
-    memcpy(h->buf,src,(size_t)bytes);
-    h->bytes=bytes; h->n=n; memcpy(h->sha,sha,64);
-    h->last=++g_kvhot_clock; h->used++;
-    g_kvhot_bytes+=bytes;
-    kvhot_evict_to_budget();
+  int slot=kvhot_map_find(n,sha);
+  if(slot<0 || !(g_kvhot[slot].n==n && !memcmp(g_kvhot[slot].sha,sha,64))) slot=kvhot_make_room();
+  KVHot *h=&g_kvhot[slot];
+  kvhot_entry_free(h);
+  h->buf=malloc((size_t)bytes);
+  if(!h->buf) return;                         /* OOM: skip hot, SSD resta valido */
+  memcpy(h->buf,src,(size_t)bytes);
+  h->bytes=bytes; h->mapped=0; h->n=n; memcpy(h->sha,sha,64);
+  h->last=++g_kvhot_clock; h->used++; h->hits=0;
+  g_kvhot_bytes+=bytes;
+  kvhot_map_insert(n,sha,slot);
+  kvhot_evict_to_budget();
+}
+/* vista mmap del file SSD: il tier RAM NON fa copia privata, e' un overlay
+ * sulla page-cache. Abilitato da KVDB_MMAP=1. */
+static void kvhot_put_mmap(const char *sha, int n, uint8_t *base, int64_t sz){
+  int slot=kvhot_map_find(n,sha);
+  if(slot<0 || !(g_kvhot[slot].n==n && !memcmp(g_kvhot[slot].sha,sha,64))) slot=kvhot_make_room();
+  KVHot *h=&g_kvhot[slot];
+  kvhot_entry_free(h);
+  h->buf=base; h->bytes=sz; h->mapped=1; h->n=n; memcpy(h->sha,sha,64);
+  h->last=++g_kvhot_clock; h->used++; h->hits=0;
+  g_kvhot_bytes+=sz;
+  kvhot_map_insert(n,sha,slot);
+  kvhot_evict_to_budget();
 }
 static void kvhot_evict_to_budget(void){
-    while(g_kvhot_bytes>g_kvhot_budget && g_kvhot_n>0){
-        int lr=0; for(int i=1;i<g_kvhot_n;i++) if(g_kvhot[i].last<g_kvhot[lr].last) lr=i;
-        g_kvhot_bytes-=g_kvhot[lr].bytes; free(g_kvhot[lr].buf);
-        g_kvhot[lr]=g_kvhot[--g_kvhot_n];       /* compatta */
-    }
+  while(g_kvhot_bytes>g_kvhot_budget && g_kvhot_n>0){
+    int lr=0; for(int i=1;i<g_kvhot_n;i++) if(g_kvhot[i].last<g_kvhot[lr].last) lr=i;
+    kvhot_map_remove(g_kvhot[lr].n, g_kvhot[lr].sha);
+    kvhot_entry_free(&g_kvhot[lr]);
+    g_kvhot[lr]=g_kvhot[--g_kvhot_n];
+    if(g_kvhot_n>0) kvhot_map_reslot(g_kvhot[lr].n, g_kvhot[lr].sha, lr);
+  }
 }
 
 static void kvdb_path(const char *snap){
-    snprintf(g_kvdb_dir,sizeof(g_kvdb_dir),"%s/.coli_kvdb",snap);
-    /* crea la dir una volta (evita system() per-call e race) */
-    char dm[2048]; snprintf(dm,sizeof(dm),"%s",g_kvdb_dir);
-    for(char *p=dm+1;*p;p++) if(*p=='/'){ *p=0; mkdir(dm,0755); *p='/'; }
-    mkdir(dm,0755);
-}
-static int64_t kvdb_rec_bytes(Model *m){
-    Cfg *c=&m->c;
-    int64_t rec=(int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
-    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i])
-        rec+=(int64_t)c->index_hd*4;
-    return rec;
+  g_kvdb_model_id = fnv1a_str(snap);
+  const char *q=getenv("KVDB_QUANT"); if(q && atoi(q)>0) g_kvdb_quant=atoi(q);
+  const char *bg=getenv("KVDB_BUDGET_GB"); if(bg){ double gb=atof(bg); if(gb>0) g_kvdb_budget=(int64_t)(gb*1024*1024*1024); }
+  const char *al=getenv("KVDB_ALIGN"); if(al && atoi(al)>=256) g_kvdb_align=atoi(al);
+  const char *tr=getenv("KVDB_TRIM"); if(tr && atoi(tr)>=0) g_kvdb_trim=atoi(tr);
+  const char *fp=getenv("KVDB_FP16"); if(fp && atoi(fp)>0) g_kvdb_fp16=1;
+  const char *mm=getenv("KVDB_MMAP"); if(mm && atoi(mm)>0) g_kvdb_mmap=1;
+  const char *hg=getenv("KVHOT_GB"); if(hg){ double gb=atof(hg); if(gb>0) g_kvhot_budget=(int64_t)(gb*1024*1024*1024); }
+  snprintf(g_kvdb_dir,sizeof(g_kvdb_dir),"%s/.coli_kvdb",snap);
+  char dm[2048]; snprintf(dm,sizeof(dm),"%s",g_kvdb_dir);
+  for(char *p=dm+1;*p;p++) if(*p=='/'){ *p=0; mkdir(dm,0755); *p='/'; }
+  mkdir(dm,0755);
 }
 /* Calcola lo sha256 esadecimale (64 char) dell'array di token ids[0..n-1]. */
 /* NORMALIZZAZIONE cache-stable: riscrive i pattern volatili (timestamp, date,
  * cwd, uuid/hex, key=value tipo cwd=/date=/time=) in un segnaposto fisso in
  * modo che lo sha del prefill combaci TRA sessioni anche se opencode inietta
- * data/ora/cwd diversi. Applicata al TESTO prima della tokenizzazione, sia in
- * serve che in prime, cosi' i due percorsi producono lo stesso sha. */
+ * data/ora/cwd diversi. */
 static int kvn_digit(char c){ return c>='0'&&c<='9'; }
 static int kvn_hex(char c){ return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'); }
 static int kvn_word_end(char c){ return c==' '||c=='\n'||c=='\t'||c=='"'||c=='\''||c=='<'||c=='>'||c=='|'||c=='\0'||c=='('||c==')'||c=='['||c==']'||c=='{'||c=='}'; }
 static int kvdb_normalize_text(char *s, int n){
-    if(!getenv("KVDB_NORMALIZE") || !atoi(getenv("KVDB_NORMALIZE"))) return n;
-    int w=0;
-    for(int r=0;r<n;){
-        /* orario HH:MM:SS */
-        if(r+7<n && s[r+2]==':' && s[r+5]==':'){
-            int ok=1; for(int i=0;i<8;i++){ char c=s[r+i]; if(i==2||i==5){ if(c!=':'){ok=0;break;} } else if(!kvn_digit(c)){ ok=0; break; } }
-            if(ok){ s[w++]='#'; r+=8; continue; }
-        }
-        /* data YYYY-MM-DD */
-        if(r+9<n && s[r+4]=='-' && s[r+7]=='-'){
-            int ok=1; for(int i=0;i<10;i++){ char c=s[r+i]; if(i==4||i==7){ if(c!='-'){ok=0;break;} } else if(!kvn_digit(c)){ ok=0; break; } }
-            if(ok){ s[w++]='#'; r+=10; continue; }
-        }
-        /* key=value volatili: cwd= date= time= path= */
-        if((r+4<n && !strncmp(s+r,"cwd=",4)) || (r+5<n && (!strncmp(s+r,"date=",5)||!strncmp(s+r,"time=",5)||!strncmp(s+r,"path=",5)))){
-            while(r<n && s[r]!='=') r++; if(r<n) r++;        /* salta '=' */
-            while(r<n && !kvn_word_end(s[r])) r++;           /* salta il valore */
-            s[w++]='#'; continue;
-        }
-        /* path assoluti /home /media /Users /mnt ... */
-        if(s[r]=='/' && r+1<n && (s[r+1]=='h'||s[r+1]=='m'||s[r+1]=='u'||s[r+1]=='s')){
-            while(r<n && !kvn_word_end(s[r])) r++; s[w++]='#'; continue;
-        }
-        s[w++]=s[r++];
+  if(!getenv("KVDB_NORMALIZE") || !atoi(getenv("KVDB_NORMALIZE"))) return n;
+  int w=0;
+  for(int r=0;r<n;){
+    if(r+7<n && s[r+2]==':' && s[r+5]==':'){
+      int ok=1; for(int i=0;i<8;i++){ char c=s[r+i]; if(i==2||i==5){ if(c!=':'){ok=0;break;} } else if(!kvn_digit(c)){ ok=0; break; } }
+      if(ok){ s[w++]='#'; r+=8; continue; }
     }
-    s[w]=0; return w;
+    if(r+9<n && s[r+4]=='-' && s[r+7]=='-'){
+      int ok=1; for(int i=0;i<10;i++){ char c=s[r+i]; if(i==4||i==7){ if(c!='-'){ok=0;break;} } else if(!kvn_digit(c)){ ok=0; break; } }
+      if(ok){ s[w++]='#'; r+=10; continue; }
+    }
+    if((r+4<n && !strncmp(s+r,"cwd=",4)) || (r+5<n && (!strncmp(s+r,"date=",5)||!strncmp(s+r,"time=",5)||!strncmp(s+r,"path=",5)))){
+      while(r<n && s[r]!='=') r++; if(r<n) r++;
+      while(r<n && !kvn_word_end(s[r])) r++;
+      s[w++]='#'; continue;
+    }
+    if(s[r]=='/' && r+1<n && (s[r+1]=='h'||s[r+1]=='m'||s[r+1]=='u'||s[r+1]=='s')){
+      while(r<n && !kvn_word_end(s[r])) r++; s[w++]='#'; continue;
+    }
+    s[w++]=s[r++];
+  }
+  s[w]=0; return w;
 }
 static void kvdb_sha(const int *ids, int n, char *out64){
-    unsigned char dg[SHA256_DIGEST_LENGTH];
+  unsigned char dg[SHA256_DIGEST_LENGTH];
 #if defined(__linux__)
-    SHA256_CTX ctx; SHA256_Init(&ctx);
-    SHA256_Update(&ctx, ids, (size_t)n*sizeof(int));
-    SHA256_Final(dg, &ctx);
+  SHA256_CTX ctx; SHA256_Init(&ctx);
+  SHA256_Update(&ctx, ids, (size_t)n*sizeof(int));
+  SHA256_Final(dg, &ctx);
 #else
-    (void)ids;(void)n; memset(dg,0,sizeof(dg));
+  (void)ids;(void)n; memset(dg,0,sizeof(dg));
 #endif
-    static const char *hx="0123456789abcdef";
-    for(int i=0;i<SHA256_DIGEST_LENGTH;i++){ out64[2*i]=hx[dg[i]>>4]; out64[2*i+1]=hx[dg[i]&15]; }
-    out64[64]=0;
+  static const char *hx="0123456789abcdef";
+  for(int i=0;i<SHA256_DIGEST_LENGTH;i++){ out64[2*i]=hx[dg[i]>>4]; out64[2*i+1]=hx[dg[i]&15]; }
+  out64[64]=0;
 }
-/* Cerca ids[0..S-1] nel DB. Il DB contiene prefissi calcolati in passato:
- * se trova uno sha esatto di un prefisso ids[0..P-1] (P<=S), copia le righe
- * KV di quei P token in m->kv e ritorna P (il chiamante prefilla SOLO i token
- * nuovi ids[P..S-1] con pos_base=P: l'attention li aggancia al prefisso
- * gia' calcolato). Se nessun prefisso matcha ritorna 0 (prefill da 0).
- * Nota: il forward dell'hidden x dei token prefissi NON si puo' saltare
- * (la KV compressa non lo ricostruisce), ma si saltano P layer-forward. */
-/* Impacchetta n righe KV di m->kv nel buffer buf (lungo n*rec + hidden*4).
- * Formato: per ogni posizione p: [Lc,Rc per layer] + [Ic per layer DSA] + hidden ultima pos. */
-static void kvdb_pack(Model *m, uint8_t *buf, int n, const float *xlast){
-    Cfg *c=&m->c; int64_t rec=kvdb_rec_bytes(m); (void)rec;
-    uint8_t *q=buf;
-    for(int p=0;p<n;p++){
-        for(int i=0;i<c->n_layers;i++){
-            memcpy(q, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); q+=c->kv_lora*4;
-            memcpy(q, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); q+=c->qk_rope*4;
-        }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]){
-            memcpy(q, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); q+=c->index_hd*4;
-        }
-    }
-    if(xlast) memcpy(q, xlast, (size_t)c->hidden*4);
+/* header: magic 'COLI', version, model_id, quant, flags, tokens, hits, ctx,
+ * text_len, created, last_used, payload_bytes, ids_bytes */
+static int kvdb_hdr_ok(const uint8_t *h){
+  if(h[0]!='C'||h[1]!='O'||h[2]!='L'||h[3]!='I') return 0;
+  if(kvdb_le_u32g(h+4)!=2) return 0;
+  if(kvdb_le_u32g(h+8)!=g_kvdb_model_id) return 0;
+  if(h[12]!=(uint8_t)g_kvdb_quant) return 0;
+  return 1;
 }
-/* Copia n righe KV dal buffer buf (formato pack) dentro m->kv. Se P==n copia
- * anche l'hidden in g_kvdb_xlast (HIT totale). */
-static void kvdb_unpack(Model *m, const uint8_t *buf, int n, int P){
-    Cfg *c=&m->c; int64_t rec=kvdb_rec_bytes(m); (void)rec;
-    const uint8_t *q=buf;
-    for(int p=0;p<P;p++){
-        for(int i=0;i<c->n_layers;i++){
-            memcpy(m->Lc[i]+(int64_t)p*c->kv_lora, q, (size_t)c->kv_lora*4); q+=c->kv_lora*4;
-            memcpy(m->Rc[i]+(int64_t)p*c->qk_rope,q, (size_t)c->qk_rope*4); q+=c->qk_rope*4;
-        }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]){
-            memcpy(m->Ic[i]+(int64_t)p*c->index_hd, q, (size_t)c->index_hd*4); q+=c->index_hd*4;
-        }
-    }
-    if(P==n){
-        if(!g_kvdb_xlast || g_kvdb_xlen!=c->hidden){
-            free(g_kvdb_xlast); g_kvdb_xlast=falloc((int64_t)c->hidden); g_kvdb_xlen=c->hidden;
-        }
-        memcpy(g_kvdb_xlast, q, (size_t)c->hidden*4);
-    }
+static void kvdb_hdr_emit(uint8_t *h, int n, int text_len, Model *m){
+  memset(h,0,KVDB_HDR_SIZE);
+  h[0]='C';h[1]='O';h[2]='L';h[3]='I';
+  kvdb_le_u32(h+4,2);
+  kvdb_le_u32(h+8,g_kvdb_model_id);
+  h[12]=(uint8_t)g_kvdb_quant;
+  h[13]=(uint8_t)(g_kvdb_fp16?1:0);   /* bit0 = fp16 storage */
+  h[14]=0; h[15]=0;
+  kvdb_le_u32(h+16,(uint32_t)n);
+  kvdb_le_u32(h+20,0);
+  kvdb_le_u32(h+24,0);
+  kvdb_le_u32(h+28,(uint32_t)text_len);
+  int64_t now=(int64_t)time(NULL);
+  kvdb_le_i64(h+32,now); kvdb_le_i64(h+40,now);
+  kvdb_le_i64(h+48,kvdb_payload_bytes(m,n));
+  kvdb_le_i64(h+56,(int64_t)n*4);
+}
+static int64_t kvdb_blob_bytes(Model *m, int n, int text_len){
+  return (int64_t)KVDB_HDR_SIZE + text_len + (int64_t)n*4 + kvdb_payload_bytes(m,n);
+}
+/* pack KV rows [0..n) + last hidden into a self-describing blob */
+static void kvdb_build_blob(uint8_t *buf, Model *m, int n, const float *xlast,
+                            const char *text, int text_len, const int *ids){
+  Cfg *c=&m->c; int es=kvdb_elsize();
+  kvdb_hdr_emit(buf,n,text_len,m);
+  uint8_t *q=buf+KVDB_HDR_SIZE;
+  if(text_len>0 && text) memcpy(q,text,(size_t)text_len);
+  q+=text_len;
+  for(int i=0;i<n;i++) kvdb_le_u32(q+(int64_t)i*4,(uint32_t)ids[i]);
+  q+=(int64_t)n*4;
+  /* LAYER-MAJOR + optional fp16: each layer's full positional block is
+   * contiguous in the model (Lc[i]/Rc[i] span all positions), so we do
+   * n_layers big memcpys (or fp16 conversions) instead of n*n_layers tiny ones. */
+  int64_t layer_lc=(int64_t)n*c->kv_lora, layer_rc=(int64_t)n*c->qk_rope, layer_ic=(int64_t)n*c->index_hd;
+  for(int i=0;i<c->n_layers;i++){
+    if(es==2){ q=kvdb_put_f16(q, m->Lc[i], layer_lc); q=kvdb_put_f16(q, m->Rc[i], layer_rc); }
+    else { memcpy(q, m->Lc[i], (size_t)layer_lc*4); q+=(size_t)layer_lc*4;
+           memcpy(q, m->Rc[i], (size_t)layer_rc*4); q+=(size_t)layer_rc*4; }
+  }
+  if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]){
+    if(es==2) q=kvdb_put_f16(q, m->Ic[i], layer_ic);
+    else { memcpy(q, m->Ic[i], (size_t)layer_ic*4); q+=(size_t)layer_ic*4; }
+  }
+  if(xlast){ if(es==2) q=kvdb_put_f16(q, xlast, c->hidden); else memcpy(q, xlast, (size_t)c->hidden*4); }
+}
+/* unpack P KV rows from a full blob into m->kv; set g_kvdb_xlast if P==full n.
+ * storage precision is read from the header flag (bit0 of h[13]) so a fp16
+ * blob loads correctly even if KVDB_FP16 is currently off. */
+static void kvdb_unpack_blob(const uint8_t *buf, Model *m, int P){
+  Cfg *c=&m->c;
+  int text_len=(int)kvdb_le_u32g(buf+28);
+  int n=(int)kvdb_le_u32g(buf+16);
+  int es = (buf[13]&1)?2:4;
+  const uint8_t *q=buf+KVDB_HDR_SIZE+text_len+(int64_t)n*4;
+  int64_t layer_lc=(int64_t)P*c->kv_lora, layer_rc=(int64_t)P*c->qk_rope, layer_ic=(int64_t)P*c->index_hd;
+  for(int i=0;i<c->n_layers;i++){
+    if(es==2){ q=kvdb_get_f16(q, m->Lc[i], layer_lc); q=kvdb_get_f16(q, m->Rc[i], layer_rc); }
+    else { memcpy(m->Lc[i], q, (size_t)layer_lc*4); q+=(size_t)layer_lc*4;
+           memcpy(m->Rc[i], q, (size_t)layer_rc*4); q+=(size_t)layer_rc*4; }
+  }
+  if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]){
+    if(es==2) q=kvdb_get_f16(q, m->Ic[i], layer_ic);
+    else { memcpy(m->Ic[i], q, (size_t)layer_ic*4); q+=(size_t)layer_ic*4; }
+  }
+  if(P==n){
+    if(!g_kvdb_xlast || g_kvdb_xlen!=c->hidden){ free(g_kvdb_xlast); g_kvdb_xlast=falloc((int64_t)c->hidden); g_kvdb_xlen=c->hidden; }
+    if(es==2) kvdb_get_f16(q, g_kvdb_xlast, c->hidden);
+    else memcpy(g_kvdb_xlast,q,(size_t)c->hidden*4);
+  }
+}
+/* find byte length of the text prefix that tokenizes to ~target tokens */
+static int kvdb_text_len_for_tokens(const char *text, int text_len, const int *ids, int target, Tok *T){
+  (void)ids;
+  int lo=0, hi=text_len, best=0;
+  while(lo<=hi){
+    int mid=(lo+hi)/2;
+    int cap=target+2; int *tmp=malloc((size_t)cap*sizeof(int));
+    int nt=tok_encode(T, text, mid, tmp, cap);
+    free(tmp);
+    if(nt<=target){ best=mid; lo=mid+1; }
+    else hi=mid-1;
+  }
+  return best;
+}
+/* bump hits + last_used on an existing SSD entry (ds4-style touch) */
+static void kvdb_touch_file(const char *path){
+  FILE *b=fopen(path,"r+b"); if(!b) return;
+  uint8_t h[KVDB_HDR_SIZE];
+  if(fread(h,1,KVDB_HDR_SIZE,b)!=KVDB_HDR_SIZE){ fclose(b); return; }
+  if(!kvdb_hdr_ok(h)){ fclose(b); return; }
+  uint32_t hits=kvdb_le_u32g(h+20)+1;
+  kvdb_le_u32(h+20,hits);
+  kvdb_le_i64(h+40,(int64_t)time(NULL));
+  fseeko(b,0,SEEK_SET); fwrite(h,1,KVDB_HDR_SIZE,b); fflush(b); fclose(b);
+}
+/* load a whole .kv file (validated) and unpack it; promote to HOT; return P.
+ * With KVDB_MMAP=1 the file is mmap'd and the HOT entry stores the mapping
+ * directly (page-cache overlay of the SSD KV files, no private copy). */
+static int kvdb_load_file(const char *path, const char *sha, Model *m, int S){
+  FILE *b=fopen(path,"rb"); if(!b) return 0;
+  fseeko(b,0,SEEK_END); int64_t sz=ftello(b); fseeko(b,0,SEEK_SET);
+  if(sz<KVDB_HDR_SIZE){ fclose(b); return 0; }
+  uint8_t *base=NULL; int is_mmap=0;
+#ifndef _WIN32
+  if(g_kvdb_mmap){
+    int fd=fileno(b);
+    base=mmap(NULL,(size_t)sz,PROT_READ,MAP_PRIVATE,fd,0);
+    if(base!=MAP_FAILED) is_mmap=1;
+  }
+#endif
+  if(!is_mmap){
+    base=malloc((size_t)sz);
+    if(!base || fread(base,1,(size_t)sz,b)!=(size_t)sz){ if(base) free(base); fclose(b); return 0; }
+  }
+  fclose(b);
+  if(!kvdb_hdr_ok(base)){
+    if(is_mmap) munmap(base,(size_t)sz); else free(base);
+    return 0;
+  }
+  int nn=(int)kvdb_le_u32g(base+16);
+  double t0=now_s();
+  kvdb_unpack_blob(base,m,nn);
+  if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+  kvdb_touch_file(path);
+  g_kvhot_loads++;
+  if(is_mmap) kvhot_put_mmap(sha,nn,base,sz);
+  else { kvhot_put(sha,nn,base,sz); free(base); }
+  fprintf(stderr,"[KVDB] HIT sha=%c%c%c%c%c%c%c%c prefix=%d/%d in %.1fms%s\n",
+    sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],nn,S,(now_s()-t0)*1e3,
+    nn==S?" (FORWARD COMPLETO SALTATO)":"");
+  return nn;
+}
+/* evict SSD entries past the disk budget, lowest (hits+1)*tokens/size first,
+ * with exponential decay of hits by idle time (ds4 hit-decay). */
+static void kvdb_evict_to_budget(void){
+  if(g_kvdb_budget<=0) return;
+  DIR *d=opendir(g_kvdb_dir); if(!d) return;
+  typedef struct { char path[2300]; int64_t size; double score; } Ent;
+  Ent *es=NULL; int ne=0, cap=0; struct dirent *de;
+  while((de=readdir(d))){
+    int L=(int)strlen(de->d_name);
+    if(L<43 || strcmp(de->d_name+L-3,".kv")) continue;
+    char path[2300]; snprintf(path,sizeof(path),"%s/%s",g_kvdb_dir,de->d_name);
+    struct stat st; if(stat(path,&st)!=0) continue;
+    FILE *b=fopen(path,"rb"); if(!b) continue;
+    uint8_t h[KVDB_HDR_SIZE];
+    if(fread(h,1,KVDB_HDR_SIZE,b)!=KVDB_HDR_SIZE){ fclose(b); continue; }
+    fclose(b);
+    if(!kvdb_hdr_ok(h)) continue;
+    int nn=(int)kvdb_le_u32g(h+16); uint32_t hits=kvdb_le_u32g(h+20);
+    int64_t created=kvdb_le_i64g(h+32), used=kvdb_le_i64g(h+40);
+    int64_t now=(int64_t)time(NULL);
+    double eh=(double)hits;
+    int64_t base=(used>0)?used:created;
+    if(now>base) eh*=pow(2.0,-(double)(now-base)/(double)KVDB_HALF_LIFE);
+    double score=(eh+1.0)*(double)nn/(double)st.st_size;
+    if(ne>=cap){ cap=cap?cap*2:16; es=realloc(es,(size_t)cap*sizeof(Ent)); }
+    snprintf(es[ne].path,sizeof(es[ne].path),"%s",path);
+    es[ne].size=st.st_size; es[ne].score=score; ne++;
+  }
+  closedir(d);
+  int64_t total=0; for(int i=0;i<ne;i++) total+=es[i].size;
+  while(total>g_kvdb_budget && ne>0){
+    int w=0; for(int i=1;i<ne;i++) if(es[i].score<es[w].score) w=i;
+    if(unlink(es[w].path)==0){ total-=es[w].size;
+      fprintf(stderr,"[KVDB] evict score=%.3f size=%.1fMB %s\n",es[w].score,es[w].size/1e6,es[w].path); }
+    es[w]=es[--ne];
+  }
+  free(es);
+}
+
+/* incremental SHA256 over the token-id prefixes: precompute the hash midstate
+ * after each 64-byte block once, then any prefix sha is an O(1) finalize. This
+ * turns the cold-miss path from O(S^2) full hashes into O(S). */
+static int kvdb_midstates(const int *ids, int S, SHA256_CTX **out){
+  int nbytes=S*4; int nfull=nbytes/64;
+  SHA256_CTX *ms=malloc((size_t)(nfull+1)*sizeof(SHA256_CTX));
+  if(!ms){ *out=NULL; return 0; }
+  SHA256_CTX ctx; SHA256_Init(&ctx);
+  memcpy(&ms[0],&ctx,sizeof(ctx));
+  const unsigned char *bp=(const unsigned char*)ids;
+  for(int b=0;b<nfull;b++){ SHA256_Update(&ctx,bp+(size_t)b*64,64); memcpy(&ms[b+1],&ctx,sizeof(ctx)); }
+  *out=ms; return nfull;
+}
+static void kvdb_sha_at(SHA256_CTX *ms, const int *ids, int P, char *out64){
+  int pb=P*4; int k=pb/64;
+  SHA256_CTX ctx; memcpy(&ctx,&ms[k],sizeof(ctx));
+  int rem=pb-k*64;
+  if(rem>0) SHA256_Update(&ctx,(const unsigned char*)ids+(size_t)k*64,(size_t)rem);
+  unsigned char dg[SHA256_DIGEST_LENGTH]; SHA256_Final(dg,&ctx);
+  static const char *hx="0123456789abcdef";
+  for(int i=0;i<SHA256_DIGEST_LENGTH;i++){ out64[2*i]=hx[dg[i]>>4]; out64[2*i+1]=hx[dg[i]&15]; }
+  out64[64]=0;
 }
 
 static int kvdb_load(Model *m, const int *ids, int S){
-    if(!g_kvdb || S<1) return 0;
-    Cfg *c=&m->c; int64_t rec=kvdb_rec_bytes(m);
-    g_kvdb_xlen=0;     /* reset segnale HIT totale (forza re-read in caso di match) */
-    /* ---- TIER 1: HOT RAM (dentro il processo) ---- */
-    for(int P=S; P>=1; P--){
-        char sha[65]; kvdb_sha(ids,P,sha);
-        int64_t need=P*rec + (P==S?(int64_t)c->hidden*4:0);
-        uint8_t *hb=kvhot_get(sha,P);
-        if(hb){
-            double t0=now_s();
-            kvdb_unpack(m,hb,P,P);
-            if(m->has_mtp) m->kv_start[c->n_layers]=-1;
-            fprintf(stderr,"[KVDB] HOT sha=%c%c%c%c%c%c%c%c prefix=%d/%d in %.2fms%s\n",
-                sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],P,S,(now_s()-t0)*1e3,
-                P==S?" (FORWARD COMPLETO SALTATO)":"");
-            return P;
-        }
-        (void)need;
+  if(!g_kvdb || S<1) return 0;
+  g_kvdb_xlen=0;     /* reset segnale HIT totale (forza re-read in caso di match) */
+  SHA256_CTX *ms=NULL; kvdb_midstates(ids,S,&ms);
+  int res=0;
+  /* ---- TIER 1: HOT RAM (dentro il processo) ---- */
+  for(int P=S; P>=1; P--){
+    char sha[65]; if(ms) kvdb_sha_at(ms,ids,P,sha); else kvdb_sha(ids,P,sha);
+    uint8_t *hb=kvhot_get(sha,P);
+    if(hb){
+      double t0=now_s();
+      kvdb_unpack_blob(hb,m,P);
+      if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+      fprintf(stderr,"[KVDB] HOT sha=%c%c%c%c%c%c%c%c prefix=%d/%d in %.2fms%s\n",
+        sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],P,S,(now_s()-t0)*1e3,
+        P==S?" (FORWARD COMPLETO SALTATO)":"");
+      res=P; goto done;
     }
-    /* ---- TIER 2: SSD (.coli_kvdb/) ---- */
-    for(int P=S; P>=1; P--){
-        char sha[65]; kvdb_sha(ids,P,sha);
-        char idx[2200]; snprintf(idx,sizeof(idx),"%s/index.tsv",g_kvdb_dir);
-        FILE *f=fopen(idx,"r"); if(!f) return 0;
-        char line[512]; int found=0; long bytes=0;
-        while(fgets(line,sizeof(line),f)){
-            if(strncmp(line,sha,64)) continue;
-            long nt=0, by=0;
-            if(sscanf(line+64," %ld %ld",&nt,&by)!=2) continue;
-            if(nt!=P) break;
-            found=1; bytes=by; break;
-        }
-        fclose(f);
-        if(!found) continue;
-        char blob[2200]; snprintf(blob,sizeof(blob),"%s/kv.%s",
-            g_kvdb_dir,sha);
-        FILE *b=fopen(blob,"rb"); if(!b) return 0;
-        if(bytes < (long)(P*rec + c->hidden*4)){ fclose(b); continue; }
-        double t0=now_s();
-        int64_t need=P*rec + (P==S?(int64_t)c->hidden*4:0);
-        uint8_t *buf=malloc((size_t)need);
-        if(!buf){ fclose(b); return 0; }
-        if(fread(buf,1,(size_t)need,b)!=(size_t)need){ free(buf); fclose(b); return 0; }
-        kvdb_unpack(m,buf,P,P);
-        if(m->has_mtp) m->kv_start[c->n_layers]=-1;
-        /* promuovi in HOT RAM per gli swap futuri */
-        g_kvhot_loads++;
-        kvhot_put(sha,P,buf,need);
-        free(buf); fclose(b);
-        fprintf(stderr,"[KVDB] HIT sha=%c%c%c%c%c%c%c%c prefix=%d/%d in %.1fms%s\n",
-            sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],P,S,(now_s()-t0)*1e3,
-            P==S?" (FORWARD COMPLETO SALTATO)":"");
-        return P;
+  }
+  /* ---- TIER 1b: HOT RAM per prefisso di TESTO (byte-prefix di g_kvdb_text, ids verificati) ---- */
+  if(g_kvdb_text && g_kvdb_text_len>0){
+    int bestP=0; const uint8_t *best=NULL;
+    for(int i=0;i<g_kvhot_n;i++){
+      const uint8_t *bb=g_kvhot[i].buf;
+      if(!kvdb_hdr_ok(bb)) continue;
+      int tl=(int)kvdb_le_u32g(bb+28); int nn=(int)kvdb_le_u32g(bb+16);
+      if(tl<=0||tl>g_kvdb_text_len) continue;
+      if(memcmp(bb+KVDB_HDR_SIZE,g_kvdb_text,tl)!=0) continue;
+      const uint8_t *idp=bb+KVDB_HDR_SIZE+tl;
+      int ok=1; for(int j=0;j<nn && j<S;j++) if(kvdb_le_u32g(idp+(int64_t)j*4)!=(uint32_t)ids[j]){ ok=0; break; }
+      if(!ok) continue;
+      if(nn>bestP){ bestP=nn; best=bb; }
     }
-    return 0;
+    if(best){
+      double t0=now_s();
+      kvdb_unpack_blob(best,m,bestP);
+      if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+      fprintf(stderr,"[KVDB] HOT text prefix=%d/%d in %.2fms\n", bestP,S,(now_s()-t0)*1e3);
+      res=bestP; goto done;
+    }
+  }
+  /* ---- TIER 2: SSD (.coli_kvdb/) per token-id (hit diretto sul filename) ---- */
+  for(int P=S; P>=1; P--){
+    char sha[65]; if(ms) kvdb_sha_at(ms,ids,P,sha); else kvdb_sha(ids,P,sha);
+    char path[2200]; snprintf(path,sizeof(path),"%s/kv.%s",g_kvdb_dir,sha);
+    int got=kvdb_load_file(path,sha,m,S);
+    if(got>0){ res=got; goto done; }
+  }
+  /* ---- TIER 2b: SSD per prefisso di TESTO (byte-prefix + verifica ids) ---- */
+  if(g_kvdb_text && g_kvdb_text_len>0){
+    DIR *d=opendir(g_kvdb_dir); struct dirent *de;
+    int bestnn=0; char bestpath[2200]={0}; char bestsha[65]={0};
+    while(d && (de=readdir(d))){
+      int L=(int)strlen(de->d_name);
+      if(L<43 || strcmp(de->d_name+L-3,".kv")) continue;
+      char path[2200]; snprintf(path,sizeof(path),"%s/%s",g_kvdb_dir,de->d_name);
+      FILE *b=fopen(path,"rb"); if(!b) continue;
+      uint8_t h[KVDB_HDR_SIZE];
+      if(fread(h,1,KVDB_HDR_SIZE,b)!=KVDB_HDR_SIZE){ fclose(b); continue; }
+      if(!kvdb_hdr_ok(h)){ fclose(b); continue; }
+      int tl=(int)kvdb_le_u32g(h+28); int nn=(int)kvdb_le_u32g(h+16);
+      if(tl<=0||tl>g_kvdb_text_len){ fclose(b); continue; }
+      char *tx=malloc((size_t)tl+1);
+      if(fread(tx,1,(size_t)tl,b)!=(size_t)tl){ free(tx); fclose(b); continue; }
+      int okp=(memcmp(tx,g_kvdb_text,tl)==0);
+      int idok=0;
+      if(okp && nn<=S){
+        uint8_t *ib=malloc((size_t)nn*4);
+        if(fread(ib,1,(size_t)nn*4,b)==(size_t)nn*4){
+          idok=1; for(int j=0;j<nn;j++) if(kvdb_le_u32g(ib+(int64_t)j*4)!=(uint32_t)ids[j]){ idok=0; break; }
+        }
+        free(ib);
+      }
+      fclose(b); free(tx);
+      if(okp && idok && nn>bestnn){
+        bestnn=nn; snprintf(bestpath,sizeof(bestpath),"%s",path);
+        memcpy(bestsha,de->d_name+3,64); bestsha[64]=0;
+      }
+    }
+    if(d) closedir(d);
+    if(bestnn>0){ int got=kvdb_load_file(bestpath,bestsha,m,S); if(got>0){ res=got; goto done; } }
+  }
+done:
+  if(ms) free(ms);
+  return res;
 }
 /* Salva ids[0..n-1] nel DB: le righe KV + l'hidden dell'ultima pos (xlast).
- * xlast va passato dal chiamante DOPO il forward reale. */
+ * xlast va passato dal chiamante DOPO il forward reale. Con boundary trim/align
+ * (ds4) si memorizza un prefisso allineato a multipli di g_kvdb_align cosi' che
+ * il KV caricato combaci ESATTAMENTE con un prefill freddo al boundary. */
 static void kvdb_save(Model *m, const int *ids, int n, const float *xlast){
-    if(!g_kvdb || n<1) return;
-    char sha[65]; kvdb_sha(ids,n,sha);
-    char idx[2200]; snprintf(idx,sizeof(idx),"%s/index.tsv",g_kvdb_dir);
-    /* evita duplicati: se lo sha c'e' gia', skip */
-    FILE *f=fopen(idx,"r");
-    if(f){ char line[512];
-        while(fgets(line,sizeof(line),f)) if(!strncmp(line,sha,64)){ fclose(f); return; }
-        fclose(f);
-    }
-    /* la dir e' gia' stata creata da kvdb_path() all'avvio */
-    Cfg *c=&m->c; int64_t rec=kvdb_rec_bytes(m); long bytes=(long)(n*rec + c->hidden*4);
-    char blob[2200]; snprintf(blob,sizeof(blob),"%s/kv.%s",
-        g_kvdb_dir,sha);
-    FILE *b=fopen(blob,"wb"); if(!b) return;
-    uint8_t *buf=malloc((size_t)bytes);
-    if(!buf){ fclose(b); return; }
-    kvdb_pack(m,buf,n,xlast);
-    fwrite(buf,1,(size_t)bytes,b);
-    free(buf);
-    fclose(b);
-    FILE *af=fopen(idx,"a"); if(af){ fprintf(af,"%s %d %ld\n",sha,n,bytes); fclose(af); }
-    fprintf(stderr,"[KVDB] SAVE sha=%c%c%c%c%c%c%c%c ntok=%d bytes=%ld\n",
-        sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],n,bytes);
-    /* promuovi subito in HOT RAM: il prossimo swap di questa sessione e' gratis */
-    uint8_t *hot=malloc((size_t)bytes); if(hot){ kvdb_pack(m,hot,n,xlast); kvhot_put(sha,n,hot,(int64_t)bytes); free(hot); }
+  if(!g_kvdb || n<1) return;
+  int store_len=n;
+  if(n > g_kvdb_min+g_kvdb_trim){
+    int stable=n-g_kvdb_trim;
+    if(g_kvdb_align>0) stable-=stable%g_kvdb_align;
+    if(stable>=g_kvdb_min) store_len=stable;
+  }
+  int text_len=0; const char *text=NULL;
+  if(g_kvdb_text && g_kvdb_T && g_kvdb_text_len>0){
+    int bl=kvdb_text_len_for_tokens(g_kvdb_text, g_kvdb_text_len, ids, store_len, g_kvdb_T);
+    text_len=bl; text=g_kvdb_text;
+  }
+  char sha[65]; kvdb_sha(ids,store_len,sha);
+  char path[2200]; snprintf(path,sizeof(path),"%s/kv.%s",g_kvdb_dir,sha);
+  int64_t bytes=kvdb_blob_bytes(m,store_len,text_len);
+  uint8_t *buf=malloc((size_t)bytes); if(!buf) return;
+  kvdb_build_blob(buf,m,store_len,xlast,text,text_len,ids);
+  char tmp[2300]; snprintf(tmp,sizeof(tmp),"%s.tmp.%ld",path,(long)getpid());
+  FILE *f=fopen(tmp,"wb"); if(!f){ free(buf); return; }
+  int ok=(fwrite(buf,1,(size_t)bytes,f)==(size_t)bytes);
+  fclose(f);
+  if(!ok){ unlink(tmp); free(buf); return; }
+  rename(tmp,path);
+  fprintf(stderr,"[KVDB] SAVE sha=%c%c%c%c%c%c%c%c ntok=%d store=%d text=%d bytes=%lld\n",
+    sha[0],sha[1],sha[2],sha[3],sha[4],sha[5],sha[6],sha[7],n,store_len,text_len,(long long)bytes);
+  kvhot_put(sha,store_len,buf,bytes);   /* kvhot_put copies into its own buffer */
+  free(buf);
+  kvdb_evict_to_budget();
 }
 
 /* PRIME del livello HOT RAM + SSD da un file o directory di prompt (Hermes/opencode).
  * Ogni file e' trattato come il payload <|user|> ed e' tokenizzato CON lo stesso
- * chat-template del serve ([gMASK]<sop><|user|>INPUT<|assistant|><think></think>) cosi'
+ * chat-template del serve ([gMASK]<sop><|user|>X<|assistant|><think></think>) cosi'
  * lo sha calcolato qui combacia con quello che il serve richiedera' -> HIT immediato,
  * anche sulla primissima richiesta. step() gia' innesca kvdb_save + kvhot_put. */
 static void kvhot_prime(Model *m, const char *snap, const char *path){
-    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp);
-    int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
-    /* raccogli i path: se e' una dir, tutti i .json/.md/.txt/.yaml/.yml, altrimenti il file */
-    char **list=malloc(sizeof(char*)*1024); int nfile=0;
-    struct stat st;
-    if(!stat(path,&st) && S_ISDIR(st.st_mode)){
-        DIR *d=opendir(path); struct dirent *de;
-        const char *ext[]={".json",".md",".txt",".yaml",".yml",NULL};
-        while(d && (de=readdir(d))){
-            char *dot=strrchr(de->d_name,'.'); if(!dot) continue;
-            int ok=0; for(int i=0;ext[i];i++) if(!strcasecmp(dot,ext[i])) ok=1;
-            if(!ok) continue;
-            char *fp=malloc(strlen(path)+strlen(de->d_name)+2);
-            sprintf(fp,"%s/%s",path,de->d_name);
-            if(nfile<1024) list[nfile++]=fp;
-        }
-        if(d) closedir(d);
-    } else if(!stat(path,&st)) { list[nfile++]=strdup(path); }
-    fprintf(stderr,"[KVPRIME] %d prompt da '%s' (CTX=%d)\n", nfile, path, maxctx);
-    for(int fi=0; fi<nfile; fi++){
-        FILE *f=fopen(list[fi],"rb"); if(!f) continue;
-        fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-        char *txt=malloc((size_t)sz+1); size_t szr=(size_t)sz; if(fread(txt,1,szr,f)!=szr){ fclose(f); free(txt); continue; }
-        fclose(f); txt[sz]=0;
-        /* stesso template del serve (templ=1 di default): [gMASK]<sop><|user|>X<|assistant|><think></think> */
-        char *buf=malloc((size_t)sz+256);
-        int bl=snprintf(buf, sz+256, "[gMASK]<sop><|user|>%s<|assistant|><think></think>", txt);
-        bl=kvdb_normalize_text(buf,bl);   /* stesso trattamento del serve -> sha identico */
-        free(txt);
-        int cap=bl+16; int *ids=malloc(cap*sizeof(int));
-        int nt=tok_encode(&T,buf,(int)strlen(buf),ids,cap);
-        free(buf);
-        if(nt<1){ free(ids); continue; }
-        if(nt>=maxctx-8-g_draft) nt=maxctx-8-g_draft;
-        kv_alloc(m, nt+g_draft+2);
-        double t0=now_s();
-        step(m, ids, nt, 0);          /* prefill completo -> dentro step() scatta kvdb_save + hot put */
-        fprintf(stderr,"[KVPRIME] %s: %d token prefill in %.2fs -> HOT+SSD pronti\n",
-            list[fi], nt, now_s()-t0);
-        free(ids);
+  char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+  Tok T; tok_load(&T,tkp);
+  int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+  char **list=malloc(sizeof(char*)*1024); int nfile=0;
+  struct stat st;
+  if(!stat(path,&st) && S_ISDIR(st.st_mode)){
+    DIR *d=opendir(path); struct dirent *de;
+    const char *ext[]={".json",".md",".txt",".yaml",".yml",NULL};
+    while(d && (de=readdir(d))){
+      char *dot=strrchr(de->d_name,'.'); if(!dot) continue;
+      int ok=0; for(int i=0;ext[i];i++) if(!strcasecmp(dot,ext[i])) ok=1;
+      if(!ok) continue;
+      char *fp=malloc(strlen(path)+strlen(de->d_name)+2);
+      sprintf(fp,"%s/%s",path,de->d_name);
+      if(nfile<1024) list[nfile++]=fp;
     }
-    for(int i=0;i<nfile;i++) free(list[i]); free(list);
-    fprintf(stderr,"[KVPRIME] fatto. HOT RAM: %d prompt, %.1f MB\n",
-        g_kvhot_n, g_kvhot_bytes/1e6);
+    if(d) closedir(d);
+  } else if(!stat(path,&st)) { list[nfile++]=strdup(path); }
+  fprintf(stderr,"[KVPRIME] %d prompt da '%s' (CTX=%d)\n", nfile, path, maxctx);
+  for(int fi=0; fi<nfile; fi++){
+    FILE *f=fopen(list[fi],"rb"); if(!f) continue;
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    char *txt=malloc((size_t)sz+1); size_t szr=(size_t)sz; if(fread(txt,1,szr,f)!=szr){ fclose(f); free(txt); continue; }
+    fclose(f); txt[sz]=0;
+    char *buf=malloc((size_t)sz+256);
+    int bl=snprintf(buf, sz+256, "[gMASK]<sop><|user|>%s<|assistant|><think></think>", txt);
+    bl=kvdb_normalize_text(buf,bl);   /* stesso trattamento del serve -> sha identico */
+    free(txt);
+    int cap=bl+16; int *ids=malloc(cap*sizeof(int));
+    int nt=tok_encode(&T,buf,(int)strlen(buf),ids,cap);
+    if(nt<1){ free(ids); free(buf); continue; }
+    if(nt>=maxctx-8-g_draft) nt=maxctx-8-g_draft;
+    kv_alloc(m, nt+g_draft+2);
+    double t0=now_s();
+    kvdb_set_text(buf, bl, &T);   /* buf must stay alive through step() (the save reads it) */
+    step(m, ids, nt, 0);          /* prefill completo -> dentro step() scatta kvdb_save + hot put */
+    kvdb_clear_text();
+    fprintf(stderr,"[KVPRIME] %s: %d token prefill in %.2fs -> HOT+SSD pronti\n",
+      list[fi], nt, now_s()-t0);
+    free(ids);
+    free(buf);
+  }
+  for(int i=0;i<nfile;i++) free(list[i]); free(list);
+  fprintf(stderr,"[KVPRIME] fatto. HOT RAM: %d prompt, %.1f MB\n",
+    g_kvhot_n, g_kvhot_bytes/1e6);
 }
 
 /* SELFTEST del livello HOT RAM: verifica che dopo un save il kvdb_load serva
  * dallo HOT RAM (memcpy, zero disco/forward) e non dall'SSD. Eseguibile via
  * KVDB_SELFTEST=1 senza server, per validare il tier in modo deterministico. */
 static void kvdb_selftest(Model *m, const char *snap){
-    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp);
-    const char *txt="System prompt stable: you are a local assistant. No timestamps.";
-    char buf[1024]; int bl=snprintf(buf,sizeof(buf),"[gMASK]<sop><|user|>%s<|assistant|><think></think>",txt);
-    int cap=bl+16; int *ids=malloc(cap*sizeof(int));
-    int nt=tok_encode(&T,buf,bl,ids,cap);
-    if(nt<1){ fprintf(stderr,"[KVSELF] FAIL: empty tokenization\n"); free(ids); return; }
-    kv_alloc(m, nt+g_draft+2);
-    uint64_t h0=g_kvhot_hits;
-    step(m, ids, nt, 0);                 /* save -> SSD + HOT put */
-    int hot_n0=g_kvhot_n;
-    g_kvdb_xlast=NULL; g_kvdb_xlen=0;    /* forza re-load */
-    int P=kvdb_load(m, ids, nt);         /* deve venire dallo HOT RAM */
-    if(P==nt && g_kvhot_hits>h0 && g_kvhot_n==hot_n0)
-        fprintf(stderr,"[KVSELF] PASS: HOT RAM served full prefill (P=%d, hits+%llu, hot_n=%d)\n",
-            P,(unsigned long long)(g_kvhot_hits-h0),g_kvhot_n);
-    else
-        fprintf(stderr,"[KVSELF] FAIL: P=%d hot_hits+%llu hot_n=%d (expected P=%d, hits>0)\n",
-            P,(unsigned long long)(g_kvhot_hits-h0),g_kvhot_n,nt);
-    free(ids);
+  char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+  Tok T; tok_load(&T,tkp);
+  const char *txt="System prompt stable: you are a local assistant. No timestamps.";
+  char buf[1024]; int bl=snprintf(buf,sizeof(buf),"[gMASK]<sop><|user|>%s<|assistant|><think></think>",txt);
+  int cap=bl+16; int *ids=malloc(cap*sizeof(int));
+  int nt=tok_encode(&T,buf,bl,ids,cap);
+  if(nt<1){ fprintf(stderr,"[KVSELF] FAIL: empty tokenization\n"); free(ids); return; }
+  kv_alloc(m, nt+g_draft+2);
+  uint64_t h0=g_kvhot_hits;
+  kvdb_set_text(buf, bl, &T);
+  step(m, ids, nt, 0);                 /* save -> SSD + HOT put */
+  kvdb_clear_text();
+  int hot_n0=g_kvhot_n;
+  g_kvdb_xlast=NULL; g_kvdb_xlen=0;    /* forza re-load */
+  int P=kvdb_load(m, ids, nt);         /* deve venire dallo HOT RAM */
+  if(P==nt && g_kvhot_hits>h0 && g_kvhot_n==hot_n0)
+    fprintf(stderr,"[KVSELF] PASS: HOT RAM served full prefill (P=%d, hits+%llu, hot_n=%d)\n",
+      P,(unsigned long long)(g_kvhot_hits-h0),g_kvhot_n);
+  else
+    fprintf(stderr,"[KVSELF] FAIL: P=%d hot_hits+%llu hot_n=%d (expected P=%d, hits>0)\n",
+      P,(unsigned long long)(g_kvhot_hits-h0),g_kvhot_n,nt);
+  free(ids);
 }
+
 
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
@@ -5423,6 +5776,10 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
         free(raw); free(line); return -1;
     }
     raw[sub.bytes]=0;
+    /* normalized copy used only as the text-key for the KV cache (tokenization
+     * below still uses the unnormalized raw text, so model output is unchanged). */
+    char *raw_n=malloc((size_t)sub.bytes+1); memcpy(raw_n,raw,(size_t)sub.bytes); raw_n[sub.bytes]=0;
+    int raw_n_len=kvdb_normalize_text(raw_n,(int)sub.bytes);
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
         printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
     }
@@ -5447,6 +5804,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
      * soli token nuovi. Solo per slot "nuovi" (sc->len==0): se la sessione ha
      * gia' la sua KV in RAM non serve il DB. */
     if(g_kvdb && sc->len==0){
+        kvdb_set_text(raw_n, raw_n_len, T);   /* text-key for KV cache (cross-session prefix reuse) */
         int Pg=kvdb_load(m, tmp, nt);
         if(Pg>sc->len){
             memcpy(sc->hist, tmp, (size_t)Pg*sizeof(int));   /* storico coerente col KV caricato */
@@ -5460,6 +5818,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                          : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
+    kvdb_clear_text(); free(raw_n);   /* done with the prompt text for this request */
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
@@ -5660,6 +6019,7 @@ static void run_serve(Model *m, const char *snap){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             input_n=kvdb_normalize_text(input,input_n);   /* cache-stable: neutralizza timestamp/cwd */
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
+            kvdb_set_text(input, input_n, &T);   /* text-key for KV cache (raw/API prompts are full) */
             int old_len=len, prefix=0;
             while(prefix<old_len && prefix<prompt_tokens && hist[prefix]==tmp[prefix]) prefix++;
             if(prefix<old_len){
@@ -5697,6 +6057,7 @@ static void run_serve(Model *m, const char *snap){
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
+        kvdb_clear_text();   /* text-key only needed during the prefill step */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
         grammar_reset();                         /* nuova risposta = nuovo documento (MORE invece continua) */

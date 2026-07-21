@@ -26,6 +26,7 @@ Config: configs/colibri.toml (override with $COLI_CONFIG).
 This CLI does not modify any default configuration.
 """
 import sys, os, json, subprocess, urllib.request, urllib.error, urllib.parse, tomllib
+import hashlib, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -309,15 +310,18 @@ def proxy_chat(sec, prompt):
         sys.exit(f"chat failed: {e.code} {e.read().decode()[:500]}")
 
 
-def chat_completion(base_url, api_key, model, messages, timeout=120):
-    """Minimal OpenAI chat completion; returns the assistant text (no streaming)."""
+def chat_completion(base_url, api_key, model, messages, timeout=120, opener=None):
+    """Minimal OpenAI chat completion; returns the assistant text (no streaming).
+    `opener` (a urllib.request.OpenerDirector) is optional and reused across calls
+    for a single transport/SSL config per run (the hook for keep-alive)."""
     url = base_url.rstrip("/") + "/chat/completions"
     body = json.dumps({"model": model, "messages": messages, "temperature": 0,
-                       "max_tokens": 1024}).encode()
+                        "max_tokens": 1024}).encode()
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    op = opener or urllib.request
+    with op.urlopen(req, timeout=timeout) as r:
         return json.load(r)["choices"][0]["message"]["content"]
 
 
@@ -598,16 +602,124 @@ def hermes_check(cfg, extra=None):
         eprint(f"[WARN] {murl} unavailable ({type(e).__name__}); cannot verify model_id")
 
 
-def run_harness(cfg, task):
+def _harness_cache_dir():
+    d = os.path.expanduser("~/.cache/colibri/harness")
+    try: os.makedirs(d, exist_ok=True)
+    except OSError: pass
+    return d
+
+def _harness_cache_key(name, task):
+    return hashlib.sha256(f"{name}::{task}".encode("utf-8")).hexdigest()
+
+def harness_cache_get(name, task, ttl_h):
+    """Durable KV of subtask results (ds4-style): reuse a prior subagent answer
+    for an identical subtask across runs. ttl_h<=0 means cache forever; ttl_h<0
+    disables the lookup."""
+    if ttl_h < 0:
+        return None
+    p = os.path.join(_harness_cache_dir(), _harness_cache_key(name, task) + ".json")
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    if ttl_h > 0 and (time.time() - d.get("ts", 0)) > ttl_h * 3600:
+        return None
+    return d.get("result")
+
+def harness_cache_put(name, task, result):
+    p = os.path.join(_harness_cache_dir(), _harness_cache_key(name, task) + ".json")
+    try:
+        with open(p, "w") as f:
+            json.dump({"ts": time.time(), "name": name, "task": task,
+                       "result": result}, f)
+    except OSError:
+        pass
+
+def harness_cache_clear():
+    d = _harness_cache_dir()
+    n = 0
+    for fn in os.listdir(d):
+        if fn.endswith(".json"):
+            try: os.remove(os.path.join(d, fn)); n += 1
+            except OSError: pass
+    return n
+
+def _harness_final_key(task, results):
+    """Key on the exact (original task + resolved subtask outputs). Identical
+    inputs that resolve to identical subtask answers produce an identical final
+    synthesis, so the whole harness short-circuits with zero network calls."""
+    h = hashlib.sha256()
+    h.update(b"FINAL::")
+    h.update(task.encode("utf-8"))
+    h.update(b"\n")
+    for name, r in results:
+        h.update(f"{name}::{r}".encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+def final_cache_get(task, results, ttl_h):
+    if ttl_h < 0:
+        return None
+    p = os.path.join(_harness_cache_dir(), "final_" + _harness_final_key(task, results) + ".json")
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    if ttl_h > 0 and (time.time() - d.get("ts", 0)) > ttl_h * 3600:
+        return None
+    return d.get("result")
+
+def final_cache_put(task, results, final):
+    p = os.path.join(_harness_cache_dir(), "final_" + _harness_final_key(task, results) + ".json")
+    try:
+        with open(p, "w") as f:
+            json.dump({"ts": time.time(), "result": final}, f)
+    except OSError:
+        pass
+
+def _harness_plan_key(task, subs):
+    """Key on the task + configured subagent set, so a config change that adds
+    or removes subagents invalidates the cached plan."""
+    return hashlib.sha256(("PLAN::" + task + "::" + ",".join(sorted(subs))).encode("utf-8")).hexdigest()
+
+def plan_cache_get(task, subs, ttl_h):
+    if ttl_h < 0:
+        return None
+    p = os.path.join(_harness_cache_dir(), "plan_" + _harness_plan_key(task, subs) + ".json")
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    if ttl_h > 0 and (time.time() - d.get("ts", 0)) > ttl_h * 3600:
+        return None
+    return d.get("plan_text")
+
+def plan_cache_put(task, subs, plan_text):
+    p = os.path.join(_harness_cache_dir(), "plan_" + _harness_plan_key(task, subs) + ".json")
+    try:
+        with open(p, "w") as f:
+            json.dump({"ts": time.time(), "plan_text": plan_text}, f)
+    except OSError:
+        pass
+
+def run_harness(cfg, task, fresh=False):
     """Tier-3 orchestrator: a small LM plans subtasks, each is fanned out to a
     subagent (tiny.<name>) endpoint in parallel, results are collected and the
     orchestrator synthesizes a final answer.
 
     Hardened: plan is schema-validated (unknown/empty subtasks dropped), each
-    subtask runs with a timeout + bounded retries, results are truncated before
-    synthesis, and the fan-out respects a per-subtask timeout so one slow
-    subagent can't hang the whole task.
+    subtask runs with a timeout + bounded retries (exponential backoff), results
+    are truncated before synthesis, the fan-out respects a per-subtask timeout so
+    one slow subagent can't hang the whole task, and identical subtasks are
+    memoized to a durable cache (ds4-style): the orchestrator plan, each subtask
+    result, and the fully-synthesized final answer are all cached, so an
+    identical task returns instantly with zero network calls.
     """
+    import hashlib, time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     h = cfg.get("harness", {})
     if not h.get("enabled", True):
         sys.exit("harness disabled in config ([harness].enabled=false)")
@@ -619,13 +731,23 @@ def run_harness(cfg, task):
     orch_timeout = int(h.get("orchestrator_timeout_s", 180))
     subtask_timeout = int(h.get("subtask_timeout_s", 120))
     max_result = int(h.get("max_result_chars", 4000))
-    retries = int(h.get("subtask_retries", 1))
+    retries = int(h.get("subtask_retries", 2))
+    backoff = float(h.get("subtask_backoff_s", 2.0))
+    cache_enabled = (not fresh) and bool(h.get("cache", True))
+    cache_ttl_h = int(h.get("cache_ttl_h", 24))   # <0 disables lookup entirely
+    cache_final = bool(h.get("cache_final", True))
+    final_cache_on = cache_enabled and cache_final
+    cache_plan = bool(h.get("cache_plan", True))
+    plan_cache_on = cache_enabled and cache_plan
     if not task or task == "-":
         task = sys.stdin.read().strip()
     if not task:
         sys.exit("usage: glm harness \"<task>\"  (or pipe task via stdin)")
 
     eprint(f"[harness] task: {task[:80]}...")
+    # one transport/SSL config reused across every call in this run
+    opener = urllib.request.build_opener(urllib.request.HTTPHandler())
+
     # 1) orchestrator plans subtasks as a JSON list of {"subagent":<name>,"task":<text>}
     plan_prompt = [
         {"role": "system", "content": "You are an orchestrator. Decompose the user task into "
@@ -634,13 +756,21 @@ def run_harness(cfg, task):
          + ", ".join(subs) + ". If the task is atomic, return a single-element array."},
         {"role": "user", "content": task},
     ]
-    try:
-        plan_text = chat_completion(obu, okey, omodel, plan_prompt, timeout=orch_timeout)
-    except Exception as e:
-        sys.exit(f"[harness] orchestrator unreachable: {e}")
+    plan_cached = False
+    if plan_cache_on:
+        cached_plan = plan_cache_get(task, subs, cache_ttl_h)
+        if cached_plan is not None:
+            plan_text = cached_plan
+            plan_cached = True
+            eprint("[harness] plan cache HIT (skipped orchestrator planning call)")
+    if not plan_cached:
+        try:
+            plan_text = chat_completion(obu, okey, omodel, plan_prompt, timeout=orch_timeout, opener=opener)
+            plan_cache_put(task, subs, plan_text)
+        except Exception as e:
+            sys.exit(f"[harness] orchestrator unreachable: {e}")
     # 2) parse + validate the plan (drop unknown/empty subtasks)
     import re
-    from concurrent.futures import as_completed
     m = re.search(r"\[.*\]", plan_text, re.DOTALL)
     try:
         raw = json.loads(m.group(0)) if m else []
@@ -664,7 +794,7 @@ def run_harness(cfg, task):
     plan = plan[:max_sub]
     if not plan:
         sys.exit("[harness] orchestrator returned no valid subtasks; aborting")
-    eprint(f"[harness] plan: {len(plan)} valid subtask(s)")
+    eprint(f"[harness] plan: {len(plan)} valid subtask(s)  [cache={'on' if cache_enabled else 'off'}]")
 
     # 3) fan out each subtask to its subagent (tiny.<name>) endpoint in parallel
     def run_sub(sub):
@@ -672,19 +802,29 @@ def run_harness(cfg, task):
         sec = cfg.get("tiny", {}).get(name)
         if not sec or not sec.get("base_url"):
             return name, f"[no [tiny.{name}] endpoint configured]"
+        # memoization: identical subtasks reuse a prior subagent answer
+        if cache_enabled:
+            cached = harness_cache_get(name, stext, cache_ttl_h)
+            if cached is not None:
+                eprint(f"[harness] {name}: cache HIT (reused prior answer)")
+                return name, cached
         last = None
         for attempt in range(1, retries + 1):
             try:
                 last = chat_completion(sec["base_url"], sec.get("api_key", ""),
                                        sec.get("model_id", name),
                                        [{"role": "user", "content": stext}],
-                                       timeout=subtask_timeout)
+                                       timeout=subtask_timeout, opener=opener)
                 if len(last) > max_result:
                     last = last[:max_result] + f"\n...[truncated {len(last) - max_result} chars]"
+                if cache_enabled:
+                    harness_cache_put(name, stext, last)
                 return name, last
             except Exception as e:
                 last = e
                 eprint(f"[harness] {name} attempt {attempt}/{retries} failed: {e}")
+                if attempt < retries:
+                    _time.sleep(min(backoff * (2 ** (attempt - 1)), 30))
         return name, f"[subagent {name} error after {retries} attempts: {last}]"
 
     results = []
@@ -699,15 +839,34 @@ def run_harness(cfg, task):
     # keep original plan order for the synthesis context
     order = {s["subagent"]: i for i, s in enumerate(plan)}
     results.sort(key=lambda r: order.get(r[0], 1 << 30))
+    n_fail = sum(1 for _, r in results
+                 if isinstance(r, str) and r.startswith("[")
+                 and ("error" in r or "timeout" in r or "no [" in r))
+    eprint(f"[harness] collected {len(results)} result(s); {n_fail} failed")
 
     # 4) orchestrator synthesizes the final answer from the subtask results
-    synth_msgs = [{"role": "system", "content": "Synthesize a final answer from the subtask "
-                  "results below."},
-                  {"role": "user", "content": "\n\n".join(f"[{n}]\n{r}" for n, r in results)}]
+    # 4a) short-circuit: if this exact (task + resolved subtask results) was
+    # synthesized before, return it with zero network calls.
+    if final_cache_on:
+        cached_final = final_cache_get(task, results, cache_ttl_h)
+        if cached_final is not None:
+            eprint("[harness] final-answer cache HIT (no synthesis network call)")
+            print(cached_final)
+            return
+    synth_msgs = [
+        {"role": "system", "content": "You are a synthesizer. Use the subtask results to write a "
+         "final answer that directly addresses the user's original task. Be concise; cite which "
+         "subagent each fact came from when useful."},
+        {"role": "user", "content": f"ORIGINAL TASK:\n{task}\n\nSUBTASK RESULTS:\n"
+         + "\n\n".join(f"[{n}]\n{r}" for n, r in results)},
+    ]
     try:
-        final = chat_completion(obu, okey, omodel, synth_msgs, timeout=orch_timeout)
+        final = chat_completion(obu, okey, omodel, synth_msgs, timeout=orch_timeout, opener=opener)
+        if final_cache_on:
+            final_cache_put(task, results, final)
     except Exception as e:
-        final = "\n\n".join(f"[{n}]\n{r}" for n, r in results)  # fallback: raw concat
+        eprint(f"[harness] synthesis failed ({e}); falling back to raw concatenation")
+        final = "\n\n".join(f"[{n}]\n{r}" for n, r in results)
     print(final)
 
 
@@ -843,9 +1002,15 @@ def main():
         return
     if cmd == "harness":
         cfg, _ = load_cfg()
+        rest = args[1:]
+        if "--clear-cache" in rest:
+            n = harness_cache_clear()
+            eprint(f"[harness] cleared {n} cached subtask result(s)")
+            return
         require_armed("glm harness")
-        task = args[1] if len(args) > 1 else None
-        run_harness(cfg, task); return
+        fresh = "--fresh" in rest or "--no-cache" in rest
+        task = next((a for a in rest if not a.startswith("--")), None)
+        run_harness(cfg, task, fresh=fresh); return
     if cmd == "neutronstar":
         cfg, _ = load_cfg(); cmd_neutronstar(cfg, args); return
     if cmd in ("opencode", "hermes") or cmd.startswith("tiny-"):
