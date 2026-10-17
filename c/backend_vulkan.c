@@ -600,12 +600,177 @@ static void up_imp_release(VkUp *u, int s) {
     }
     u->nimp[s] = 0;
 }
+/* Bounded reusable external-host import buffers for staged tier tensor images.
+ * Strictly opt-in: COLI_VK_UP_POOL=1; shared source pages are held only after
+ * a completed up_finish fence. The pool is capped at 64 MiB per process.
+ * Never cache a device-local destination, model pointer or routing decision. */
+#if defined(VK_EXT_external_memory_host) && !defined(_WIN32)
+#define VK_REUSE_SLOTS 12
+#define VK_REUSE_CAP ((size_t)64 << 20)
+typedef struct {
+    VkDevice dev;
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    uint8_t *host;
+    size_t size;
+    int busy;
+} VkReusableHost;
+static VkReusableHost g_reuse[VK_REUSE_SLOTS];
+static size_t g_reuse_bytes, g_reuse_peak;
+static unsigned long long g_reuse_created, g_reuse_hits, g_reuse_fallback;
+static pthread_mutex_t g_reuse_mutex=PTHREAD_MUTEX_INITIALIZER;
+static int reuse_enabled(void) {
+    const char *flag=getenv("COLI_VK_UP_POOL");
+    return flag && strcmp(flag,"1")==0;
+}
+static uint8_t *reuse_alloc(int dev, size_t need) {
+    VkUp *u=&g_up[dev];
+    if (dev != 0 || !reuse_enabled() || !u->on || !u->dev || !u->imp_align || !u->imp_props ||
+        !need || need>VK_REUSE_CAP) return NULL;
+    pthread_mutex_lock(&g_reuse_mutex);
+    for(int i=0;i<VK_REUSE_SLOTS;i++) {
+        VkReusableHost *p=&g_reuse[i];
+        if (p->dev==u->dev && p->host && !p->busy && p->size>=need) {
+            p->busy=1;g_reuse_hits++;
+            memset(p->host,0,p->size);
+            uint8_t *result=p->host;
+            pthread_mutex_unlock(&g_reuse_mutex);
+            return result;
+        }
+    }
+    VkReusableHost *p=NULL;
+    for(int i=0;i<VK_REUSE_SLOTS;i++)if(!g_reuse[i].host) {p=&g_reuse[i];break;}
+    if(!p || g_reuse_bytes+need>VK_REUSE_CAP) goto fail;
+    size_t align=u->imp_align;
+    if(align<4096)align=4096;
+    if((align&(align-1))!=0 || need>SIZE_MAX-align)goto fail;
+    size_t sz=(need+align-1)/align*align;
+    VkExternalMemoryBufferCreateInfo ext={
+        .sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi={
+        .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext=&ext,.size=sz,
+        .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode=VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buffer=VK_NULL_HANDLE;
+    if(vkCreateBuffer(u->dev,&bi,NULL,&buffer)!=VK_SUCCESS)goto fail;
+    VkMemoryRequirements req;vkGetBufferMemoryRequirements(u->dev,buffer,&req);
+    if(req.alignment>align)align=req.alignment;
+    if((align&(align-1))!=0 || req.size>VK_REUSE_CAP-g_reuse_bytes ||
+       req.size>SIZE_MAX-align) {vkDestroyBuffer(u->dev,buffer,NULL);goto fail;}
+    size_t alloc=(size_t)req.size;
+    void *host=NULL;
+    if(posix_memalign(&host,align,alloc)!=0 || !host) {
+        vkDestroyBuffer(u->dev,buffer,NULL);goto fail;
+    }
+    memset(host,0,alloc);
+    VkMemoryHostPointerPropertiesEXT mp={.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    PFN_vkGetMemoryHostPointerPropertiesEXT gp=(PFN_vkGetMemoryHostPointerPropertiesEXT)u->imp_props;
+    if(gp(u->dev,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,host,&mp)!=VK_SUCCESS ||
+       !mp.memoryTypeBits) {
+        free(host);vkDestroyBuffer(u->dev,buffer,NULL);goto fail;
+    }
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(G.phys,&props);
+    uint32_t bits=mp.memoryTypeBits & req.memoryTypeBits;
+    int memtype=-1;
+    for(uint32_t i=0;i<props.memoryTypeCount;i++)
+        if((bits & (1u<<i)) &&
+           (props.memoryTypes[i].propertyFlags &
+              (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+              (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            memtype=(int)i;break;
+        }
+    if(memtype<0) {free(host);vkDestroyBuffer(u->dev,buffer,NULL);goto fail;}
+    VkImportMemoryHostPointerInfoEXT imp={
+        .sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .pHostPointer=host};
+    VkMemoryAllocateInfo ai={
+        .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.pNext=&imp,
+        .allocationSize=req.size,.memoryTypeIndex=(uint32_t)memtype};
+    VkDeviceMemory mem=VK_NULL_HANDLE;
+    if(vkAllocateMemory(u->dev,&ai,NULL,&mem)!=VK_SUCCESS) {
+        free(host);vkDestroyBuffer(u->dev,buffer,NULL);goto fail;
+    }
+    if(vkBindBufferMemory(u->dev,buffer,mem,0)!=VK_SUCCESS) {
+        vkFreeMemory(u->dev,mem,NULL);free(host);vkDestroyBuffer(u->dev,buffer,NULL);goto fail;
+    }
+    *p=(VkReusableHost){.dev=u->dev,.buf=buffer,.mem=mem,.host=host,
+                         .size=alloc,.busy=1};
+    g_reuse_bytes+=alloc;g_reuse_created++;
+    if(g_reuse_bytes>g_reuse_peak)g_reuse_peak=g_reuse_bytes;
+    pthread_mutex_unlock(&g_reuse_mutex);
+    return p->host;
+fail:
+    g_reuse_fallback++;
+    pthread_mutex_unlock(&g_reuse_mutex);
+    return NULL;
+}
+/* Returns 1 for a pooled address; none of these VkHandles go into
+ * u->imp[] because they must survive the ordinary per-slot fence release. */
+static int reuse_lookup(VkDevice device,const void *source,size_t bytes,
+                        VkBuffer *buffer,VkDeviceSize *off) {
+    pthread_mutex_lock(&g_reuse_mutex);
+    for(int i=0;i<VK_REUSE_SLOTS;i++) {
+        const VkReusableHost *p=&g_reuse[i];
+        uintptr_t a=(uintptr_t)p->host,s=(uintptr_t)source;
+        if(p->busy && p->dev==device && s>=a && bytes<=p->size &&
+           s-a<=p->size-bytes) {
+            *buffer=p->buf;*off=(VkDeviceSize)(s-a);
+            pthread_mutex_unlock(&g_reuse_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_reuse_mutex);
+    return 0;
+}
+static int reuse_release(void *address) {
+    pthread_mutex_lock(&g_reuse_mutex);
+    for(int i=0;i<VK_REUSE_SLOTS;i++)
+        if(g_reuse[i].host==address && g_reuse[i].busy) {
+            g_reuse[i].busy=0;
+            pthread_mutex_unlock(&g_reuse_mutex);return 1;
+        }
+    pthread_mutex_unlock(&g_reuse_mutex);
+    return 0;
+}
+static void reuse_destroy(VkDevice device) {
+    pthread_mutex_lock(&g_reuse_mutex);
+    if(device==G.dev && g_reuse_created)
+        fprintf(stderr,
+                "[VK] reusable host imports: created %llu, reused %llu, fallback %llu, peak %.2f MiB (cap 64 MiB)\n",
+                g_reuse_created,g_reuse_hits,g_reuse_fallback,g_reuse_peak/1048576.0);
+    for(int i=0;i<VK_REUSE_SLOTS;i++) {
+        VkReusableHost *p=&g_reuse[i];
+        if(p->dev!=device || !p->host)continue;
+        if(p->busy)fprintf(stderr,"[VK] WARNING: external-host reusable buffer remained busy at shutdown\n");
+        vkDestroyBuffer(device,p->buf,NULL);
+        vkFreeMemory(device,p->mem,NULL);
+        g_reuse_bytes-=p->size;
+        free(p->host);
+        *p=(VkReusableHost){0};
+    }
+    pthread_mutex_unlock(&g_reuse_mutex);
+}
+#else
+static uint8_t *reuse_alloc(int dev,size_t n){(void)dev;(void)n;return NULL;}
+static int reuse_lookup(VkDevice d,const void *s,size_t n,VkBuffer *b,VkDeviceSize *o){
+    (void)d;(void)s;(void)n;(void)b;(void)o;return 0;
+}
+static int reuse_release(void *p){(void)p;return 0;}
+static void reuse_destroy(VkDevice d){(void)d;}
+#endif
+
 /* The host image a tier tensor is filled in (coli_vk_tier_tensor, staged uploads): aligned
  * and rounded to the device's import alignment, so up_import can copy from it in place. */
 static uint8_t *up_img_alloc(int dev, size_t bytes, uint8_t *aligned) {
     size_t al = g_up[dev].imp_align;
     *aligned = al != 0;
     if (!al) return calloc(1, bytes);
+    uint8_t *cached=reuse_alloc(dev,bytes);
+    if (cached) { *aligned=2; return cached; }
     void *p = NULL;
     size_t sz = (bytes + al - 1) / al * al;
 #ifdef _WIN32
@@ -618,6 +783,7 @@ static uint8_t *up_img_alloc(int dev, size_t bytes, uint8_t *aligned) {
 }
 static void up_img_free(uint8_t *p, int aligned) {
     if (!p) return;
+    if (aligned == 2 && reuse_release(p)) return;
 #ifdef _WIN32
     if (aligned) { _aligned_free(p); return; }
 #else
@@ -670,6 +836,7 @@ static int up_init(VkUp *u) {
 static void up_destroy(VkUp *u) {
     if (!u->dev) return;
     for (int s = 0; s < VK_UP_SLOTS; s++) { up_imp_release(u, s); free(u->imp[s]); u->imp[s] = NULL; u->cimp[s] = 0; }
+    reuse_destroy(u->dev);  /* device and slot fences drained before releasing imports */
     if (u->sbuf) vkDestroyBuffer(u->dev, u->sbuf, NULL);
     if (u->smem) vkFreeMemory(u->dev, u->smem, NULL);
     for (int s = 0; s < VK_UP_SLOTS; s++) if (u->fence[s]) vkDestroyFence(u->dev, u->fence[s], NULL);
@@ -1504,6 +1671,7 @@ static int up_import(VkUp *u, const void *src, size_t bytes, VkBuffer *buf, VkDe
 #ifdef VK_EXT_external_memory_host
     if (!u->imp_align || !u->imp_props || !bytes || !up_open(u)) return 0;
     if (up_fault("import")) { u->imp_refused++; return 0; }
+    if (reuse_lookup(u->dev, src, bytes, buf, off)) return 1;
     size_t al = u->imp_align;
     uintptr_t p = (uintptr_t)src, base = p / al * al, end = (p + bytes + al - 1) / al * al;
     size_t sz = end - base;
