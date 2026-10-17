@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "date": "2026-10-17T16:37:32Z",
+  "checkpoint": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "read_only": true,
+  "validation": {
+    "layout_counts": {
+      "1": 11690,
+      "2": 693,
+      "4": 1
+    },
+    "verified_layout_keys": [
+      [
+        11,
+        204
+      ],
+      [
+        45,
+        0
+      ],
+      [
+        45,
+        197
+      ]
+    ],
+    "eof_checked": true
+  },
+  "rows": 462,
+  "gated": true,
+  "accuracy": {
+    "candidates": 715,
+    "precision": 0.4993,
+    "selected_recall": 0.09659,
+    "cold_coverage": 0.10469
+  },
+  "heldout_sha256": "ff6fafb5a515eee6bbe29a2946e039829400c0f8932eb8f86092c333daa9a42b",
+  "nominated": 714,
+  "observations": [
+    {
+      "mode": "six",
+      "calls": 4284,
+      "direct_bytes": 10124771328,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 714,
+      "sector_delta_bytes": 10124771328,
+      "expert_p50_ms": 9.2,
+      "expert_p95_ms": 10.064,
+      "expert_p99_ms": 10.959,
+      "qd2_pair_p99_ms": 11.118
+    },
+    {
+      "mode": "grouped",
+      "calls": 730,
+      "direct_bytes": 10110214144,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 714,
+      "sector_delta_bytes": 10110214144,
+      "expert_p50_ms": 8.098,
+      "expert_p95_ms": 8.635,
+      "expert_p99_ms": 8.894,
+      "qd2_pair_p99_ms": 9.218
+    },
+    {
+      "mode": "grouped",
+      "calls": 730,
+      "direct_bytes": 10110214144,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 714,
+      "sector_delta_bytes": 10110214144,
+      "expert_p50_ms": 8.12,
+      "expert_p95_ms": 8.729,
+      "expert_p99_ms": 9.403,
+      "qd2_pair_p99_ms": 9.531
+    },
+    {
+      "mode": "six",
+      "calls": 4284,
+      "direct_bytes": 10124771328,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 714,
+      "sector_delta_bytes": 10124771328,
+      "expert_p50_ms": 9.265,
+      "expert_p95_ms": 10.427,
+      "expert_p99_ms": 11.042,
+      "qd2_pair_p99_ms": 11.14
+    }
+  ],
+  "note": "No GPU upload, native layer timing or tokens/s measurement"
+}
