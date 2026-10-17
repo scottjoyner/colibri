@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "date": "2026-10-17",
+  "node": "joyner",
+  "model_revision": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "train_runs": [
+    "glm53_native_expert_trace_20261016_run01.jsonl",
+    "glm53_native_expert_trace_20261016_run02.jsonl",
+    "glm53_native_expert_trace_20261016_run03.jsonl",
+    "glm53_native_expert_trace_20261016_run04.jsonl"
+  ],
+  "heldout_run_sha256": "ff6fafb5a515eee6bbe29a2946e039829400c0f8932eb8f86092c333daa9a42b",
+  "events": 462,
+  "physical_upload_to_gpu": false,
+  "live_router_modified": false,
+  "SSD_O_DIRECT": true,
+  "replayed_independent_runs": 2,
+  "orders": [
+    "prior_token,cross_layer,fusion",
+    "fusion,cross_layer,prior_token"
+  ],
+  "bytes_read_two_runs_GB": 23.069,
+  "by_policy": {
+    "prior_token": {
+      "precision": 0.36039,
+      "selected_recall": 0.0901,
+      "cold_coverage": 0.09765,
+      "two_reader_p99_ms_runs": [
+        3.081,
+        3.35
+      ],
+      "p99_read_ms_runs": [
+        2.418,
+        2.576
+      ],
+      "physical_read_GB_each_run": 3.8588,
+      "read_count_each_run": 920
+    },
+    "cross_layer": {
+      "precision": 0.41342,
+      "selected_recall": 0.10335,
+      "cold_coverage": 0.11056,
+      "two_reader_p99_ms_runs": [
+        3.283,
+        3.144
+      ],
+      "p99_read_ms_runs": [
+        2.554,
+        2.507
+      ],
+      "physical_read_GB_each_run": 3.8168,
+      "read_count_each_run": 910
+    },
+    "fusion": {
+      "precision": 0.47294,
+      "selected_recall": 0.11824,
+      "cold_coverage": 0.12815,
+      "two_reader_p99_ms_runs": [
+        3.026,
+        3.246
+      ],
+      "p99_read_ms_runs": [
+        2.335,
+        2.575
+      ],
+      "physical_read_GB_each_run": 3.8588,
+      "read_count_each_run": 920
+    }
+  },
+  "raw_receipt_hashes_sha256": {
+    "predicted_dryrun_64.json": "5a6f7f1724bde0db9f1d71e32024bc1020a3f8a2bd55dd566046f138c6b5d690",
+    "predicted_full_462_order1.json": "c871196969300add40173a1e01b4322d9879a0fc6c4ef65b51058ea3b78d0584",
+    "predicted_full_462_order2.json": "e3c638d347e3dcb3b38c42982e193153c27b81a7f13164de312e64f14371035a",
+    "predicted_physical_96.json": "161ea3a99355b61273b492d86e5eebcc3d28a21cc5d53b15bd0012592cee5958"
+  },
+  "limitations": [
+    "4MiB tensor window only, not a full 14MiB GLM expert",
+    "Replayed synthetic-ID trace only",
+    "Shadow-only no GPU upload, token generation, caching or inference overlap",
+    "10ms deadline assumes 8GB/s upload throughput not measured concurrently",
+    "Disk sector counters include concurrent host activity",
+    "No measured token/sec benefit"
+  ]
+}
