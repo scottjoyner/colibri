@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "source": "tiny native GLM engine real Vulkan execution",
+  "staged_uploads": false,
+  "fixture_ref_sha256": "a3272444bb589f6cde889bdea768ec7147175231c3f459366d8507b08b294270",
+  "baseline": {
+    "mode": "baseline",
+    "teacher_forcing": [
+      "63",
+      "63",
+      "63",
+      "100",
+      "169",
+      "184",
+      "211",
+      "34"
+    ],
+    "greedy": [
+      "34",
+      "121",
+      "34"
+    ],
+    "grouped_loads": 3,
+    "gpu_served": 6,
+    "routed": 22,
+    "gpu_uploads": 3,
+    "repeat_skipped": 0
+  },
+  "repeat_first": {
+    "mode": "repeat_first",
+    "teacher_forcing": [
+      "63",
+      "63",
+      "63",
+      "100",
+      "169",
+      "184",
+      "211",
+      "34"
+    ],
+    "greedy": [
+      "34",
+      "121",
+      "34"
+    ],
+    "grouped_loads": 7,
+    "gpu_served": 2,
+    "routed": 22,
+    "gpu_uploads": 2,
+    "repeat_skipped": 3
+  },
+  "strict_token_parity": true,
+  "full_model_speedup_proven": false,
+  "production_services_changed": false
+}

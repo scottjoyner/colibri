@@ -75,6 +75,8 @@
 #include "st.h"
 #include "glm53_expert_read_plan.h"
 #include "glm53_expert_preadv.h"
+#include "glm53_import_safety.h"
+#include "glm53_import_safety.h"
 #include "quant.h"
 #include "tok.h"
 #include "omp_tune.h"
@@ -106,6 +108,32 @@ static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; r
 static inline void vkt_ram_gave(void) {}
 #endif
 #include "compat.h"
+#if defined(COLI_VULKAN) && !defined(_WIN32)
+/* Independent of the engine's model pathname: refuse a known dangerous
+ * import-on configuration before the full checkpoint is loaded by main().
+ * The embedded API also runs this guard before Vulkan initialization. */
+static int glm53_guard_staged_host_import(void) {
+    double total_gb=0, available_gb=0;
+    compat_meminfo_gb(&total_gb,&available_gb);
+    int decision=glm53_import_decision(total_gb,
+        getenv("COLI_VULKAN"),getenv("COLI_VK_STAGED"),
+        getenv("COLI_VK_UP_IMPORT"),getenv("GLM53_HOST_IMPORT_EXPERIMENT"));
+    if(decision==G53_IMPORT_DENY) {
+        fprintf(stderr,"[GLM53 SAFETY] REFUSED host-memory Vulkan import on <=16GiB/unknown host RAM; set COLI_VK_UP_IMPORT=0. Experimental override: GLM53_HOST_IMPORT_EXPERIMENT=1 (not fleet admission)\n");
+        return 0;
+    }
+    if(decision==G53_IMPORT_DISABLE) {
+        if(setenv("COLI_VK_UP_IMPORT","0",1)!=0) {
+            perror("[GLM53 SAFETY] setenv");
+            return 0;
+        }
+        fprintf(stderr,"[GLM53 SAFETY] low-host-RAM staged GPU uploads: forced COLI_VK_UP_IMPORT=0 (per-upload imported pages previously caused memory stalls)\n");
+    }else if(decision==G53_IMPORT_OVERRIDE) {
+        fprintf(stderr,"[GLM53 SAFETY] EXPERIMENTAL override enables known high-pressure imported-host path; this is NOT production admission\n");
+    }
+    return 1;
+}
+#endif
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
 #include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
@@ -3049,6 +3077,9 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     }
 #endif
 #ifdef COLI_VULKAN
+#if !defined(_WIN32)
+    if(!glm53_guard_staged_host_import()) exit(2);
+#endif
     /* Il device si apre dopo i pesi: se non c'e', il motore continua sulla CPU
      * senza dire niente di piu' di una riga, perche' Vulkan qui e' un'opzione
      * e non un requisito. */
@@ -4856,6 +4887,9 @@ int main(int argc, char **argv) {
      * +2.3x from this alone on a 16C/32T part and the effect grows with the
      * logical/core ratio. OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
     coli_omp_tune_threads("glm53");
+#if defined(COLI_VULKAN) && !defined(_WIN32)
+    if(!glm53_guard_staged_host_import())return 2;
+#endif
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {
