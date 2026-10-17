@@ -15,6 +15,8 @@ sys.path.insert(0,str(HERE))
 from replay_expert_prefetch import read_trace, compile_stats, N_EXPERTS
 from select_expert_policy import scores
 from shadow_tier_plan import plan, Limits
+from calibrated_prefetch_budget import fit, Calibration
+from bounded_shadow_reader import BoundedShadowReader
 
 PIN="46a050bec13002ad29ee795c16e61cf4fa3c4a9c"
 MODEL=pathlib.Path("/srv/joyner-gen5/models/glm53_colibri_i4")
@@ -118,7 +120,7 @@ def read_one(fd:int,offset:int)->float:
         return elapsed
     finally:buf.close()
 
-def benchmark(mode:str,events:list[dict],freq,cooc,index,window_ms:float,read:bool)->dict:
+def benchmark(mode:str,events:list[dict],freq,cooc,index,window_ms:float,read:bool,calibration:Calibration|None=None)->dict:
     limits=Limits(session="single-run-shadow-only",
                   pin=PIN,expected_pin=PIN,generation=1,expected_generation=1,
                   enabled=True,max_candidates=2,nvme_budget=2*14155776,
@@ -126,7 +128,7 @@ def benchmark(mode:str,events:list[dict],freq,cooc,index,window_ms:float,read:bo
                   deadline_ms=window_ms,nvme_GBps=11.319,
                   upload_GBps=8.0,overhead_ms=0.5)
     history={};nominations=[];utility=0;correct_cold=0;cold_total=0
-    actual_reads=0;elapsed=[];step_latency=[]
+    actual_reads=0;elapsed=[];step_latency=[];gated_second=0
     def disk_sector_bytes():
         return int(pathlib.Path("/sys/block/nvme0n1/stat").read_text().split()[2])*512
     # The prepared frozen plan only consults history and cached bitmaps
@@ -135,6 +137,11 @@ def benchmark(mode:str,events:list[dict],freq,cooc,index,window_ms:float,read:bo
         rank=build_policy(mode,ev,history,freq,cooc)
         picked,reason=plan(rank,ev,limits)
         assert reason in ("proposed","outside_envelope")
+        # Calibration was fitted on run05, NEVER on the held-out run06.
+        # Gate the second proposed candidate *before* consulting ground truth.
+        if calibration is not None and len(picked)>1 and not calibration.permitted(ev["layer"],1):
+            picked=picked[:1]
+            gated_second+=1
         targets={x["expert"] for x in picked}
         if any((ev["layer"],eid) not in index for eid in targets):
             raise RuntimeError("NO_GO mapped real expert missing")
@@ -157,19 +164,25 @@ def benchmark(mode:str,events:list[dict],freq,cooc,index,window_ms:float,read:bo
                     if p["tier"]=="unknown_disk_or_page_cache"}
             handles={path:os.open(path,os.O_RDONLY|os.O_DIRECT|os.O_CLOEXEC)
                      for path in needed}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            with BoundedShadowReader(
+                    session="single-run-shadow-only",pin=PIN,generation=1,
+                    read_fn=read_one,max_workers=2) as executor:
                 for row,(ev,picks,_) in enumerate(nominations):
-                    jobs=[]
+                    requests=[]
                     begin=time.perf_counter()
                     for p in picks:
                         if p["tier"]!="unknown_disk_or_page_cache":continue
                         f,off=index[(ev["layer"],p["expert"])]
-                        jobs.append(executor.submit(read_one,handles[f],off))
-                    for future in jobs:
-                        elapsed.append(future.result(timeout=4))
-                        actual_reads+=1
-                    if jobs:step_latency.append((time.perf_counter()-begin)*1000)
+                        requests.append((handles[f],off))
+                    finished=executor.read_batch(
+                        session="single-run-shadow-only",pin=PIN,
+                        generation=1,requests=requests)
+                    elapsed.extend(finished)
+                    actual_reads+=len(finished)
+                    if finished:step_latency.append((time.perf_counter()-begin)*1000)
                     if row%16==0:safety()
+                if actual_reads!=executor.completed:
+                    raise RuntimeError("NO_GO incomplete admitted disk reads")
         finally:
             for fd in handles.values():os.close(fd)
         physical_sector_bytes=disk_sector_bytes()-disk_before
@@ -179,6 +192,7 @@ def benchmark(mode:str,events:list[dict],freq,cooc,index,window_ms:float,read:bo
     planned_disk=sum(p["tier"]=="unknown_disk_or_page_cache"
                      for _,picks,_ in nominations for p in picks)
     return {"policy":mode,"rows":len(events),"candidates":submitted,
+            "adaptive_second_gated_events":gated_second,
             "candidate_precision":round(utility/max(1,submitted),5),
             "selected_recall":round(utility/(8*len(events)),5),
             "cold_selected_upper_coverage":round(correct_cold/max(1,cold_total),5),
@@ -197,10 +211,19 @@ def main():
     ap.add_argument("--window-ms",type=float,default=10.)
     ap.add_argument("--execute-io",action="store_true")
     ap.add_argument("--policy-order",default="prior_token,cross_layer,fusion")
+    ap.add_argument("--adaptive-fusion",action="store_true",
+                    help="fit second-candidate utility on independent run05; gate fusion ONLY")
+    ap.add_argument("--second-min-prob",type=float,default=0.40)
+    ap.add_argument("--adaptive-only",action="store_true",
+                    help="measure frozen fusion baseline plus validation-gated fusion only")
+    ap.add_argument("--adaptive-first",action="store_true",
+                    help="reverse measurement order of two fusion variants")
     ap.add_argument("--out",type=pathlib.Path)
     args=ap.parse_args()
     if args.rows<16 or args.rows>512 or args.window_ms<=0:
         ap.error("rows must 16..512 and deadline positive")
+    if args.adaptive_only and not args.adaptive_fusion:
+        ap.error("adaptive-only requires adaptive-fusion")
     safety()
     index=validate_model()
     names=sorted(PRIVATE.glob("glm53_native_expert_trace_20261016_run*.jsonl"))
@@ -211,10 +234,37 @@ def main():
     events=read_trace(heldout)[:args.rows]
     if any(ev["v"]!=2 for ev in events):raise RuntimeError("NO_GO no full v2 cache inventory")
     freq,cooc=compile_stats(train)
+    calibration=None
+    if args.adaptive_fusion:
+        validation=names[4]
+        if "run05" not in validation.name:
+            raise RuntimeError("NO_GO unexpected validation run")
+        validation_events=read_trace(validation)
+        calibration=fit(validation_events,
+                        lambda ev,h:build_policy("fusion",ev,h,freq,cooc),
+                        threshold=args.second_min_prob)
     policies=tuple(args.policy_order.split(","))
     if len(policies)!=3 or set(policies)!={"prior_token","cross_layer","fusion"}:
         ap.error("policy-order must be a permutation of prior_token,cross_layer,fusion")
-    results=[benchmark(p,events,freq,cooc,index,args.window_ms,args.execute_io) for p in policies]
+    # The unmodified fusion run remains an in-output baseline, and the
+    # independently calibrated fusion run is added only when explicitly asked.
+    if args.adaptive_only:
+        modes=["fusion_validation_gated","fusion"] if args.adaptive_first else [
+            "fusion","fusion_validation_gated"]
+        results=[]
+        for mode in modes:
+            result=benchmark("fusion",events,freq,cooc,index,args.window_ms,
+                             args.execute_io,
+                             calibration if mode=="fusion_validation_gated" else None)
+            result["policy"]=mode
+            results.append(result)
+    else:
+        results=[benchmark(p,events,freq,cooc,index,args.window_ms,args.execute_io) for p in policies]
+        if calibration is not None:
+            calibrated=benchmark("fusion",events,freq,cooc,index,
+                                 args.window_ms,args.execute_io,calibration)
+            calibrated["policy"]="fusion_validation_gated"
+            results.append(calibrated)
     report={"schema":1,"utc":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
             "source_pin":PIN,"verified_shards":62,"indexed_real_expert_up_tensors":len(index),
             "train_runs":[p.name for p in names[:4]],"heldout_run":heldout.name,
@@ -222,6 +272,14 @@ def main():
             "rows":len(events),"read_window_bytes":WINDOW,"max_read_workers":2,
             "deadline_ms_assumed":args.window_ms,"upload_GBps_assumed":8.0,
             "physical_io_enabled":args.execute_io,
+            "adaptive_validation":({
+                 "validation_run":names[4].name,
+                 "validation_sha256":hashlib.sha256(names[4].read_bytes()).hexdigest(),
+                 "threshold_frozen_before_heldout":calibration.threshold,
+                 "global_second_success_probability":round(calibration.global_second_probability,5),
+                 "calibration_events":calibration.train_rows,
+                 "layer_probabilities":{str(k):round(v,5) for k,v in calibration.layer_second_probability.items()}
+              } if calibration is not None else None),
             "comparison":results,
             "limitations":["Independent synthetic-ID GLM traces, not general workload",
                           "Only 4MiB up_proj tensor windows read, NOT complete 14MiB routed expert",
