@@ -119,6 +119,7 @@ static struct {
     unsigned long long routed, served, steps, uploads, upload_bytes, evictions, qfull, rated, refused, failed, warm;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
+    int plan_hist;  /* upstream cfab4f65 warm-plan history count */
     /* streaming (big prefill steps; see "streaming" below) */
     int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par;
     VStage *st;
@@ -578,24 +579,49 @@ static int plan_cmp(const void *a, const void *b) {
 }
 static uint32_t *const *g_heat_hist;
 int vkt_plan(int *layers, int *eids, int max) {
-    if (!T.on || !g_heat_hist) return 0;
-    int L = T.main_layers, E = T.c.experts, n = 0;   /* the history: the main layers' */
-    int *order = malloc((size_t)L * E * sizeof(int));
-    if (!order) return 0;
-    for (int l = 0; l < L; l++)
-        if (g_heat_hist[l]) for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) order[n++] = l * E + e;
-    g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;
-    qsort(order, (size_t)n, sizeof(int), plan_cmp);
-    int k = 0;
-    for (int i = 0; i < n && k < max && room_dev(0) >= 0; i++) {
-        VSlot *v = &T.s[order[i]];
-        if (v->state != VS_NONE) continue;
-        int dev = room_dev(0);   /* the hottest fill the primary device, the next ones the second */
-        v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++;
-        layers[k] = order[i] / E; eids[k] = order[i] % E; k++;
+    T.plan_hist = 0;
+    if (!T.on) return 0;
+    int L = T.main_layers, E = T.c.experts, n = 0, k = 0;   /* the main layers' */
+    if (g_heat_hist) {
+        int *order = malloc((size_t)L * E * sizeof(int));
+        if (!order) return 0;
+        for (int l = 0; l < L; l++)
+            if (g_heat_hist[l]) for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) order[n++] = l * E + e;
+        g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;
+        qsort(order, (size_t)n, sizeof(int), plan_cmp);
+        for (int i = 0; i < n && k < max && room_dev(0) >= 0; i++) {
+            VSlot *v = &T.s[order[i]];
+            if (v->state != VS_NONE) continue;
+            int dev = room_dev(0);   /* the hottest fill the primary device, the next ones the second */
+            v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++;
+            layers[k] = order[i] / E; eids[k] = order[i] % E; k++;
+        }
+        free(order);
     }
-    free(order);
+    T.plan_hist = k;
+    /* only the layers the heat table has a row for: a NULL row is a layer without
+     * experts (route_trace.h's rt_drop_row), and with no table at all nothing is known */
+    const char *fill = getenv("COLI_VK_TIER_FILL");
+    if (!fill || *fill != '1' || !g_heat_hist) return k;
+    for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++)
+        for (int l = 0; l < L && k < max && room_dev(0) >= 0; l++) {
+            if (!g_heat_hist[l]) continue;
+            VSlot *v = &T.s[(size_t)l * E + e];
+            if (v->state != VS_NONE) continue;
+            int dev = room_dev(0);
+            v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++;
+            layers[k] = l; eids[k] = e; k++;
+        }
     return k;
+}
+/* The warm start's line, for every engine: "warm start, N experts" stays its head. */
+void vkt_warm_report(const char *engine, int n, double seconds) {
+    if (!T.on || n <= 0) return;
+    int all = 0;   /* the experts of the layers that have them */
+    for (int l = 0; l < T.main_layers; l++) if (g_heat_hist && g_heat_hist[l]) all += T.c.experts;
+    fprintf(stderr, "[VK] tier %s: warm start, %d experts in %.1fs (%d from the history, %d more to fill the device%s)\n",
+            engine, n, seconds, T.plan_hist < n ? T.plan_hist : n, n > T.plan_hist ? n - T.plan_hist : 0,
+            all && n >= all ? ": every expert of the model" : "");
 }
 int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
