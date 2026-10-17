@@ -22,6 +22,7 @@ import sys
 import time
 import uuid
 from glm53_competitors import sample as sample_competitors
+from glm53_quiesce import stop_units as stop_disposable_units
 
 UNITS=("fleet-r9700-vulkan-canary.service","fleet-r9700-toolcall.service")
 GPU_DEV=Path("/dev/dri/renderD128")
@@ -70,6 +71,32 @@ def unexpected_competitors():
     known={int(unit_property(u,"MainPID")) for u in UNITS if active(u)}
     return sorted(set(gpu_users())-known)
 
+def quiesce_background(*,known_pids:frozenset[int]=frozenset())->dict:
+    """Actually stop disposable GPU/CPU/SSD competitors before admitting run."""
+    activity=sample_competitors(
+        duration_s=1.0,exclude_pids=frozenset((*known_pids,os.getpid())))
+    gpu_extra=sorted(set(gpu_users())-known_pids)
+    targets=sorted({int(p["pid"]) for p in activity["competitors"]}|set(gpu_extra))
+    outcome=stop_disposable_units(targets)
+    if outcome["status"] not in ("STOPPED",):
+        raise RuntimeError("NO_GO cannot safely terminate competing workloads: "+
+                           json.dumps(outcome,sort_keys=True))
+    if targets:
+        # Sensitive process command lines never enter the receipt. Log only
+        # the exact disposable systemd units and PIDs we actually stopped.
+        RECEIPTS.mkdir(parents=True,exist_ok=True)
+        logfile=RECEIPTS/"exclusive_competitor_termination.jsonl"
+        record={"utc":__import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc).isoformat(),
+                "outcome":outcome,
+                "observed_cpu_or_io":activity["competitors"],
+                "gpu_competitor_pids":gpu_extra}
+        with logfile.open("a") as fd:
+            fd.write(json.dumps(record,sort_keys=True)+"\n")
+        print("EXCLUSIVE_TERMINATED_DISPOSABLE",json.dumps(outcome,sort_keys=True),flush=True)
+    return {"targets":targets,"result":outcome,
+            "background_nvme_bytes_s":activity["global_nvme_bytes_per_sec"]}
+
 def preflight():
     if os.uname().nodename!="joyner" or os.getuid()==0:
         raise RuntimeError("NO_GO not the unprivileged Joyner user")
@@ -114,7 +141,7 @@ def restart_and_verify(original):
     return False
 
 def run_trial(label:str):
-    fair="1" if label=="exclusive4fair2" else "0"
+    fair="1" if label.startswith("exclusive4fair-") else "0"
     args=[sys.executable,str(RUNNER),"--binary",str(MODEL_BINARY),
           "--out-dir",str(RECEIPTS),"--tier-gib","4","--rate","32",
           "--dense-host","0","--text-only","1","--fair-layers",fair,
@@ -130,27 +157,42 @@ def run_trial(label:str):
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--dry-run",action="store_true")
-    ap.add_argument("--single",choices=("exclusive4control2","exclusive4fair2"))
+    ap.add_argument("--single",choices=("control","fair"),
+                    help="run a single control or fair candidate instead of the pair")
+    ap.add_argument("--round-id",
+                    help="optional 12-character lowercase hexadecimal receipt identity")
     a=ap.parse_args()
+    if a.round_id and not re.fullmatch(r"[0-9a-f]{12}",a.round_id):
+        raise RuntimeError("NO_GO round ID must be 12 lowercase hex characters")
+    round_id=a.round_id or uuid.uuid4().hex[:12]
     LOCK.parent.mkdir(parents=True,exist_ok=True)
     with LOCK.open("w") as locked:
         try:fcntl.flock(locked,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError("NO_GO GLM exclusive benchmark already active")
+        # Validate output identity BEFORE any termination. Re-running a
+        # completed case may never disrupt other jobs simply to return NO_GO.
+        labels=([f"exclusive4{a.single}-{round_id}"] if a.single else
+                [f"exclusive4control-{round_id}",f"exclusive4fair-{round_id}"])
+        print("EXCLUSIVE_ROUND_ID",round_id,"CASES",labels,flush=True)
+        if not a.dry_run:
+            for name in labels:
+                if (RECEIPTS/(name+".json")).exists():
+                    raise RuntimeError("NO_GO existing receipt "+name+"; never overwrite")
         # Claim the exclusive lock first, then remove ONLY leftover scopes
         # from this exact GLM benchmark namespace. Unknown workloads remain
         # untouched and cause a denial in preflight() instead.
         from exclusive_joyner_restore import stop_owned_scopes
-        stale=stop_owned_scopes()
-        if stale:print("EXCLUSIVE_STOPPED_STALE_BENCH_SCOPES",stale,flush=True)
+        if not a.dry_run:
+            stale=stop_owned_scopes()
+            if stale:print("EXCLUSIVE_STOPPED_STALE_BENCH_SCOPES",stale,flush=True)
+            # Known canary PIDs are intentionally stopped later, with restoration.
+            known=frozenset(int(unit_property(u,"MainPID")) for u in UNITS if active(u))
+            quiesce_background(known_pids=known)
         before=preflight()
         print("EXCLUSIVE_PREFLIGHT",json.dumps(before,sort_keys=True),flush=True)
         if a.dry_run:
             print("DRY_RUN_ONLY nothing stopped or benchmarked",flush=True)
             return 0
-        labels=[a.single] if a.single else ["exclusive4control2","exclusive4fair2"]
-        for name in labels:
-            if (RECEIPTS/(name+".json")).exists():
-                raise RuntimeError("NO_GO existing receipt "+name+"; never overwrite")
         tag="glm53-excl-restore-"+uuid.uuid4().hex[:8]
         # Register restoration BEFORE stopping anything. This timer survives
         # an abrupt SSH or Python exit. It is a backstop, not the normal path.
@@ -173,6 +215,7 @@ def main():
                 raise RuntimeError("NO_GO GPU still held after stopping exact canary units; "+str(gpu_users()))
             # An independently launched workload may start while services
             # are draining. Never knowingly benchmark with that contention.
+            quiesce_background()
             quiet=sample_competitors(duration_s=1.0,
                                      exclude_pids=frozenset((os.getpid(),)))
             if quiet["competitors"]:

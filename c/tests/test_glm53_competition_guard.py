@@ -34,6 +34,24 @@ class CompetitionGuardTest(unittest.TestCase):
         with patch.object(m,"scan_processes",return_value=({},0)),             patch.object(m,"observe_processes",return_value=[]),             patch.object(m,"exclusive_gpu_competitors",return_value=[555]):
             _,report=m.exclusive_competition_scan({},4.,"glm53-tier-ab-123456789abc")
         self.assertEqual(report["gpu_users"],[555])
+    def test_unique_isolated_round_label_accepted(self):
+        args=["glm53","--binary","/nonexistent","--out-dir","/nonexistent",
+              "--tier-gib","4","--rate","32","--dense-host","0",
+              "--text-only","1","--fair-layers","0",
+              "--label","exclusive4control-abcdef123456","--isolated"]
+        with patch("sys.argv",args),patch.object(m,"validate",
+                                                side_effect=RuntimeError("PINNED_LABEL_ACCEPTED")):
+            with self.assertRaisesRegex(RuntimeError,"PINNED_LABEL_ACCEPTED"):
+                m.main()
+    def test_unique_round_label_denies_shared_gpu_run(self):
+        args=["glm53","--binary","/nonexistent","--out-dir","/nonexistent",
+              "--tier-gib","4","--rate","32","--dense-host","0",
+              "--text-only","1","--fair-layers","0",
+              "--label","exclusive4control-abcdef123456"]
+        with patch("sys.argv",args),patch.object(m,"validate") as val:
+            with self.assertRaisesRegex(SystemExit,"pinned"):
+                m.main()
+            val.assert_not_called()
     def test_nonisolated_passes_both_healthy(self):
         with patch.object(m,"check_endpoint",return_value=True) as c:
             self.assertIsNone(m.competition_violation(isolated=False))

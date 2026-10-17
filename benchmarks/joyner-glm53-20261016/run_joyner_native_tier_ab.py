@@ -23,6 +23,7 @@ import sys
 import time
 import uuid
 from glm53_competitors import scan as scan_processes, observe as observe_processes
+from glm53_quiesce import stop_units as stop_disposable_units
 
 STAGE = Path("/srv/joyner-gen5/colibri-fork-dense-stage")
 MODEL = Path("/srv/joyner-gen5/models/glm53_colibri_i4")
@@ -224,8 +225,14 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
                     proc_prev=next_proc
                     proc_sample_at=time.monotonic()
                     if contenders["cpu_or_ssd"] or contenders["gpu_users"]:
+                        targets=sorted(set([int(x["pid"]) for x in
+                           contenders["cpu_or_ssd"]]+contenders["gpu_users"]))
+                        # Terminate only verified disposable units; the running
+                        # trial was already contaminated and MUST be invalid.
+                        action=stop_disposable_units(targets)
                         observed_competitors.append(
-                            {"at_s":round(elapsed,2),**contenders})
+                            {"at_s":round(elapsed,2),**contenders,
+                             "termination":action})
                         result["stop_reason"]="unexpected_cpu_disk_or_gpu_competitor"
                 if result.get("stop_reason"):
                     subprocess.run(["systemctl","--user","stop",unit+".scope"],
@@ -283,7 +290,8 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
                          int(decode[1])==8 and greedy is not None and
                          greedy[1].strip()==EXPECTED_GREEDY and
                          result["gpu_routed"]==3696)
-    output.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
+    with output.open("x") as receipt:
+        receipt.write(json.dumps(result,indent=2,sort_keys=True)+"\n")
     return result
 
 def main():
@@ -292,7 +300,7 @@ def main():
     pa.add_argument("--out-dir",required=True,type=Path)
     pa.add_argument("--tier-gib",required=True,type=float)
     pa.add_argument("--rate",required=True,type=int)
-    pa.add_argument("--label",required=True,choices=("baseline2","dense_host0","textonly2","textonly4","textonly8","textonly4control","textonly4fair","textonly8fair","textonly4faircache2","exclusive4control","exclusive4fair","exclusive4control2","exclusive4fair2"))
+    pa.add_argument("--label",required=True)
     pa.add_argument("--dense-host",required=True,type=int,choices=(0,1))
     pa.add_argument("--text-only",required=True,type=int,choices=(0,1))
     pa.add_argument("--fair-layers",type=int,default=0,choices=(0,1))
@@ -311,8 +319,15 @@ def main():
              (4.0,32,0,1,1,"exclusive4fair"),
              (4.0,32,0,1,0,"exclusive4control2"),
              (4.0,32,0,1,1,"exclusive4fair2")}
-    if (a.tier_gib,a.rate,a.dense_host,a.text_only,a.fair_layers,a.label) not in allowed:
-        raise SystemExit("NO_GO only pinned tier+dense+vision+fair placements")
+    dynamic=re.fullmatch(r"exclusive4(control|fair)-[0-9a-f]{12}",a.label)
+    valid_dynamic=(dynamic is not None and a.isolated and
+                   (a.tier_gib,a.rate,a.dense_host,a.text_only)==(4.0,32,0,1)
+                   and a.fair_layers==(1 if dynamic.group(1)=="fair" else 0))
+    if ((a.tier_gib,a.rate,a.dense_host,a.text_only,a.fair_layers,a.label)
+         not in allowed and not valid_dynamic):
+        raise SystemExit("NO_GO only pinned benchmark configurations")
+    if not re.fullmatch(r"[a-z0-9_-]{1,72}",a.label):
+        raise SystemExit("NO_GO invalid report label")
     if a.expert_gb != (1.25 if a.label=="textonly4faircache2" else 0.05):
         raise SystemExit("NO_GO non-pinned CPU expert-cache budget")
     report=a.out_dir/(a.label+".json")

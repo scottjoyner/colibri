@@ -81,3 +81,48 @@ tests pass. The latest dry run inspected 495 processes, found no unexpected
 high-activity process or NVMe work, left the two canaries running, and
 verified both endpoints returned HTTP 200. No new full-model throughput
 measurement was run for this guard-only change.
+
+## Automatic termination of registered disposable competitors
+
+The exclusive controller now actively stops competing user-managed jobs in
+explicit disposable systemd service/scope namespaces: glm53-disposable-,
+colibri-disposable-, opencode-disposable-, or hermes-disposable-, each followed
+by exactly 12 lowercase hexadecimal characters and a .service/.scope suffix.
+This identity, process UID and cgroup membership must all match. Mere
+process-name resemblance, high CPU, or an untrusted arbitrary PID is never
+sufficient authorization to terminate a service.
+
+Before stopping canaries, the controller measures CPU usage, SSD I/O, memory
+usage and unexpected R9700 owners, stops recognized disposable competitors,
+and verifies their unit ownership has gone away. It repeats the inspection
+after the GPU is cleared. During the benchmark a newly detected competitor
+of this type is terminated, but the **affected trial is still invalidated**
+and its termination is included in the failed trial receipt. Unrecognized
+CPU/GPU/SSD contenders cause an immediate NO_GO, and system infrastructure,
+user sessions and network/storage services are not terminated.
+
+These stop operations are audited in a private append-only JSONL receipt
+with the approved unit, PID, observed resource contention and time. The
+controller dry-run performs no termination. A new exclusive invocation
+generates a unique 12-character round identity so existing receipts are
+never overwritten, and two runs of the same binary remain paired by
+that identity.
+
+Physical proof on Joyner: first, an explicitly tagged disposable service
+was stopped by its exact unit and its original process exited. A second
+CPU-saturating disposable service was then measured at about 1.0 CPU core
+and **automatically terminated by the controller's contender sampler**.
+Both active Tailnet inference endpoints stayed HTTP 200; no production
+application or infrastructure unit was stopped in those tests.
+
+The relevant tests include nine synthetic process-identity/termination
+controls, including cross-user, production-unit, lookalike, dry-run and mixed
+safe/unsafe PID denial. All exact units must be registered as disposable
+by their launch configuration; ordinary unregistered OpenCode/Hermes
+workloads cannot be silently destroyed.
+
+The full-model benchmark runner now accepts unique paired names of the form
+exclusive4control-<12 lowercase hex> and exclusive4fair-<12 lowercase hex>
+only with --isolated and only at the pinned 4 GiB / 32-promotion configuration.
+Two additional tests verify unique round labels cannot bypass GPU isolation.
+The old results are preserved and remain independently auditable.
