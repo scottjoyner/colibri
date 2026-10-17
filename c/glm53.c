@@ -1786,6 +1786,93 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
 }
 
 
+/* Fork-only expert/prediction telemetry.  This is a measurement interface, NOT
+ * a prefetch path.  Native router decisions, logits, eviction and tier allocation
+ * are unaffected.  No prompt bytes or full hidden activations are persisted.
+ *
+ * The 16-dimensional fixed, signed sketch is deliberately cheap and stable.
+ * It is NOT guaranteed private: enable only on consenting offline benchmark
+ * inputs and keep the resulting file on the experiment machine.
+ *
+ * A trace is one model process, single-request harness; serving concurrency
+ * needs an explicit session key and independent file stream in a later slice.
+ */
+static FILE *g53_trace_fp;
+static int g53_trace_init_done, g53_trace_step, g53_trace_rows;
+#define G53_TRACE_MAX_ROWS 100000
+#define G53_TRACE_SKETCH 16
+
+static void g53_expert_trace_close(void) {
+    if (g53_trace_fp) { fclose(g53_trace_fp); g53_trace_fp = NULL; }
+}
+static int g53_expert_trace_enabled(void) {
+    if (!g53_trace_init_done) {
+        g53_trace_init_done = 1;
+        const char *path = getenv("GLM53_EXPERT_TRACE");
+        if (path && *path) {
+            if (strlen(path) > 2048) {
+                fprintf(stderr, "GLM53_EXPERT_TRACE path too long\n"); exit(1);
+            }
+            /* Exclusively create a private trace; never truncate an earlier
+             * run, and fail closed if the directory is not available. */
+            g53_trace_fp = fopen(path, "wx");
+            if (!g53_trace_fp) {
+                perror("GLM53_EXPERT_TRACE exclusive create"); exit(1);
+            }
+#if !defined(_WIN32)
+            if (chmod(path, S_IRUSR | S_IWUSR)) {
+                perror("GLM53_EXPERT_TRACE permissions"); exit(1);
+            }
+#endif
+            setvbuf(g53_trace_fp, NULL, _IOLBF, 0);
+        }
+    }
+    return g53_trace_fp != NULL;
+}
+static void g53_expert_trace_route(GModel *m, int layer, int row,
+                                   const float *hidden, const int *ids,
+                                   const float *gates, int topk) {
+    if (!g53_expert_trace_enabled()) return;
+    if (g53_trace_rows >= G53_TRACE_MAX_ROWS) return; /* fixed storage bound */
+    const Cfg *c = &m->c;
+    LCache *cache = &m->ecache[layer];
+    float sketch[G53_TRACE_SKETCH] = {0};
+    /* A signed bucketed projection from the normalized attention output. */
+    for (int i = 0; i < c->hidden; i++) {
+        const unsigned int u = (unsigned int)i * 2654435761u;
+        const int bucket = (int)((u >> 24) % G53_TRACE_SKETCH);
+        const float signed_value = (u & 0x800000u) ? -hidden[i] : hidden[i];
+        sketch[bucket] += signed_value;
+    }
+    const float normalizer = (float)c->hidden / G53_TRACE_SKETCH;
+    fprintf(g53_trace_fp, "{\"v\":1,\"call\":%d,\"row\":%d,\"layer\":%d,\"n_experts\":%d,\"topk\":%d,"
+            "\"host_slots\":%d,\"host_capacity\":%d,\"ids\":[",
+            g53_trace_step, row, layer, c->n_experts, topk,
+            cache->n, cache->cap);
+    for (int k = 0; k < topk; k++) fprintf(g53_trace_fp, "%s%d", k?",":"", ids[k]);
+    fputs("],\"gates\":[", g53_trace_fp);
+    for (int k = 0; k < topk; k++) fprintf(g53_trace_fp, "%s%.8g", k?",":"", gates[k]);
+    fputs("],\"resident\":[", g53_trace_fp);
+    for (int k = 0; k < topk; k++) {
+        const int eid = ids[k];
+        /* Snapshot before expert loading, with no LRU counter mutations. */
+        int state = 0; /* 0=no known resident slot (OS page cache unknown), 1=RAM slot, 2=GPU */
+#ifdef COLI_VULKAN
+        if (vkt_resident(layer, eid)) state = 2;
+        else
+#endif
+        for (int j = 0; j < cache->n; j++)
+            if (cache->s[j].eid == eid) { state = 1; break; }
+        fprintf(g53_trace_fp, "%s%d", k?",":"", state);
+    }
+    fputs("],\"sketch\":[", g53_trace_fp);
+    for (int j = 0; j < G53_TRACE_SKETCH; j++)
+        fprintf(g53_trace_fp, "%s%.8g", j?",":"", sketch[j]/normalizer);
+    fputs("]}\n", g53_trace_fp);
+    g53_trace_rows++;
+}
+
+
 /* ---------- multi-SSD mirror for streamed experts ----------
  *
  * GLM-5.3 has its own expert loader and therefore cannot inherit the mirror
@@ -2416,7 +2503,10 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
         /* Record the exact experts and post-normalisation gates applied by
          * this layer. The shared helper also bumps .coli_usage counters. */
         rt_route(index, t, mine, mine_w, topk);
+        /* Read-only prefetch training labels + cache state, opt-in. */
+        g53_expert_trace_route(m, index, t, row, mine, mine_w, topk);
     }
+    g53_trace_step++;
     rt_trace_end();
     free(score);
 
@@ -4688,6 +4778,7 @@ int main(int argc, char **argv) {
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&served, &serve_tok);
         glm53_telemetry_save();
+        g53_expert_trace_close();
         rt_destroy();
         tok_free(&serve_tok);
         return 0;
@@ -4855,6 +4946,7 @@ int main(int argc, char **argv) {
     free(logits);
     session_close(&model, session);
     glm53_telemetry_save();
+    g53_expert_trace_close();
     rt_destroy();
     free(vision);
     free(tokens);
