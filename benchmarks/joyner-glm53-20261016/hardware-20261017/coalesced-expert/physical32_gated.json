@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "date": "2026-10-17T16:36:52Z",
+  "checkpoint": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "read_only": true,
+  "validation": {
+    "layout_counts": {
+      "1": 11690,
+      "2": 693,
+      "4": 1
+    },
+    "verified_layout_keys": [
+      [
+        11,
+        204
+      ],
+      [
+        45,
+        0
+      ],
+      [
+        45,
+        197
+      ]
+    ],
+    "eof_checked": true
+  },
+  "rows": 32,
+  "gated": true,
+  "accuracy": {
+    "candidates": 37,
+    "precision": 0.75676,
+    "selected_recall": 0.10938,
+    "cold_coverage": 0.10938
+  },
+  "heldout_sha256": "ff6fafb5a515eee6bbe29a2946e039829400c0f8932eb8f86092c333daa9a42b",
+  "nominated": 37,
+  "observations": [
+    {
+      "mode": "six",
+      "calls": 222,
+      "direct_bytes": 524673024,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 37,
+      "sector_delta_bytes": 524673024,
+      "expert_p50_ms": 8.728,
+      "expert_p95_ms": 11.21,
+      "expert_p99_ms": 16.118,
+      "qd2_pair_p99_ms": 16.338
+    },
+    {
+      "mode": "grouped",
+      "calls": 42,
+      "direct_bytes": 523935744,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 37,
+      "sector_delta_bytes": 523935744,
+      "expert_p50_ms": 7.933,
+      "expert_p95_ms": 8.781,
+      "expert_p99_ms": 9.272,
+      "qd2_pair_p99_ms": 9.339
+    },
+    {
+      "mode": "grouped",
+      "calls": 42,
+      "direct_bytes": 523935744,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 37,
+      "sector_delta_bytes": 523935744,
+      "expert_p50_ms": 7.994,
+      "expert_p95_ms": 8.553,
+      "expert_p99_ms": 8.595,
+      "qd2_pair_p99_ms": 8.739
+    },
+    {
+      "mode": "six",
+      "calls": 222,
+      "direct_bytes": 524673024,
+      "tail_bytes": 0,
+      "tail_calls": 0,
+      "experts": 37,
+      "sector_delta_bytes": 524673024,
+      "expert_p50_ms": 8.645,
+      "expert_p95_ms": 10.247,
+      "expert_p99_ms": 10.327,
+      "qd2_pair_p99_ms": 10.443
+    }
+  ],
+  "note": "No GPU upload, native layer timing or tokens/s measurement"
+}
