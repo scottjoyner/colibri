@@ -30,6 +30,7 @@
 #include "vk_tier.h"
 #include "backend_vulkan.h"
 #include "tier.h"
+#include "vk_tier_repeat.h"
 
 #define VKT_QCAP 32                 /* promotions staged and waiting for the uploader */
 #define VKT_CAND 64                 /* victim candidates kept per refresh */
@@ -42,6 +43,7 @@ typedef struct {
     uint32_t heat, last;
     uint8_t state;
     uint8_t dev;                       /* the device it is on or on its way to (0, or 1: COLI_VK_DEV2's) */
+    VktRepeatState repeat;             /* experimental per-model causal admission */
 } VSlot;
 typedef struct { int layer, eid, dev; uint8_t *buf; } VQ;
 typedef struct { int layer, eid, ok, copy_failed; ColiVkTensor *g, *u, *d; } VDone;
@@ -88,6 +90,9 @@ static struct {
     double d2_ms;
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
+    uint64_t forward_serial;          /* only native tier engine thread advances this */
+    int repeat_admit;                 /* GLM53-only explicit opt in; default disabled */
+    unsigned long long repeat_skipped; /* cold one-off transfers avoided */
     int last_layer, first_layer, promos[2], promo_cap;   /* promotions this forward, the main layers' and the extra ones', each up to the cap */
     int begin;                         /* vkt_begin_forward: the next issue starts a forward */
     /* uploader */
@@ -499,6 +504,14 @@ static int peek_victim(int k, uint64_t hs) {
  * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
  * the rows of the forward's first layer, every block of them. */
 static void new_forward(void) {
+    /* Overflow cannot alias an old forward serial, or a newly reused slot
+     * could become accidentally eligible without two fresh observations. */
+    if (T.forward_serial==UINT64_MAX) {
+        for(size_t i=0;i<(size_t)T.c.layers*T.c.experts;i++)
+            T.s[i].repeat=(VktRepeatState){0};
+        T.forward_serial=0;
+    }
+    ++T.forward_serial;
     T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0;
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
@@ -515,6 +528,10 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || !src || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return;
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || !src->g || !src->u || !src->d) return;
+    if (T.repeat_admit && !vkt_repeat_ready(&v->repeat)) {
+        T.repeat_skipped++;
+        return;
+    }
     /* the extra layers (an MTP head's) come last in a forward: their promotions are
      * counted apart, or the model's layers would always have spent the rate first */
     const int kd = kind_of(layer);
@@ -562,6 +579,7 @@ int vkt_wants(int layer, int eid) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || T.promos[kind_of(layer)] >= T.promo_cap) return 0;
+    if (T.repeat_admit && !vkt_repeat_ready(&v->repeat)) return 0;
     if (room_dev(layer) < 0 && (!v->heat || peek_victim(kind_of(layer), score(v)) < 0)) return 0;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
@@ -899,6 +917,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         T.routed++;
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
+        if (T.repeat_admit) vkt_repeat_record(&v->repeat,T.forward_serial);
         v->last = T.tick;
         cnt[e]++;
     }
@@ -1236,6 +1255,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         if (layer >= T.main_layers) T.extra_routed++;
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
+        if (T.repeat_admit) vkt_repeat_record(&v->repeat,T.forward_serial);
         v->last = T.tick;
         if (v->state != VS_RESIDENT) continue;
         if (v->dev && rows1 >= T.d2_rows) continue;    /* the second device's batch is as large as it gets */
@@ -1516,6 +1536,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     memset(&T, 0, sizeof T);
     T.c = *cfg;
     snprintf(T.engine, sizeof T.engine, "%s", eng);
+    const char *repeat_flag=getenv("COLI_VK_TIER_REPEAT_ADMIT");
+    T.repeat_admit=!strcmp(T.engine,"glm53") &&
+        repeat_flag && !strcmp(repeat_flag,"1");
+    if (T.repeat_admit)
+        fprintf(stderr,"[VK] tier glm53: EXPERIMENTAL repeat-first promotion enabled; uploads wait for two distinct forwards\n");
     if (T.c.layers < 1 || T.c.experts < 1 || T.c.hidden < 1 || T.c.inter < 1 || T.c.topk < 1) return 0;
     T.main_layers = T.c.layers;
     if (!form_init(0, T.c.gate_up, T.c.down)) {
@@ -1723,6 +1748,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             human((double)T.budget, hb, sizeof hb), ps.blocks, ps.frag, T.uploads,
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
+    if (T.repeat_admit)
+        fprintf(stderr, " | experimental repeat-first: %llu one-off promotions skipped",
+                T.repeat_skipped);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.c.extra_layers)
         fprintf(stderr, " | extra layers (%d): %llu of %llu routed experts on the device, resident %d (budget %d)",

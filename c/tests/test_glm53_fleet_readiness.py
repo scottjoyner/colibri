@@ -63,6 +63,17 @@ class FleetPreflight(unittest.TestCase):
     def test_nan_budget_refused(self):
         with self.assertRaisesRegex(ValueError,"budget"):
             mod.readiness(self.root,self.root,staging_gib=float("nan"))
+    def test_report_does_not_claim_live_registry_state(self):
+        from unittest import mock
+        fake_layout={"shards":62,"categories":{"routed_experts":{"tensors":74304}}}
+        with mock.patch.object(mod,"inspect_shards",return_value=fake_layout):
+            receipt=mod.readiness(self.root,self.root)
+        self.assertIsNone(receipt["production_model_loaded"])
+        self.assertIsNone(receipt["fleet_admitted"])
+        self.assertFalse(receipt["inference_started_by_preflight"])
+        self.assertFalse(receipt["fleet_admission_modified"])
+        self.assertEqual(receipt["decision"],"HOLD")
+
     def test_swap_measurement(self):
         (self.mem/"meminfo").write_text(
             "MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\n"

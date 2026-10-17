@@ -1,0 +1,224 @@
+{
+  "best_validation_policy": {
+    "capacity": 320,
+    "policy": "repeat_gate",
+    "rate": 32
+  },
+  "gpu_uploads_complete_before_next_forward_assumed": true,
+  "heldout_results": [
+    {
+      "capacity": 80,
+      "holdout": {
+        "evictions": 352,
+        "hit_fraction": 0.03247,
+        "hits": 120,
+        "opportunity": 3413,
+        "remaining_resident": 80,
+        "repeat_first_refused": 0,
+        "selected": 3696,
+        "upload_lower_bound_gib": 5.695,
+        "uploads": 432
+      },
+      "policy": "first",
+      "rate": 16
+    },
+    {
+      "capacity": 80,
+      "holdout": {
+        "evictions": 304,
+        "hit_fraction": 0.09416,
+        "hits": 348,
+        "opportunity": 3185,
+        "remaining_resident": 80,
+        "repeat_first_refused": 1615,
+        "selected": 3696,
+        "upload_lower_bound_gib": 5.062,
+        "uploads": 384
+      },
+      "policy": "repeat_gate",
+      "rate": 16
+    },
+    {
+      "capacity": 80,
+      "holdout": {
+        "evictions": 352,
+        "hit_fraction": 0.09794,
+        "hits": 362,
+        "opportunity": 3171,
+        "remaining_resident": 80,
+        "repeat_first_refused": 0,
+        "selected": 3696,
+        "upload_lower_bound_gib": 5.695,
+        "uploads": 432
+      },
+      "policy": "repeat_priority",
+      "rate": 16
+    },
+    {
+      "capacity": 320,
+      "holdout": {
+        "evictions": 544,
+        "hit_fraction": 0.14448,
+        "hits": 534,
+        "opportunity": 2999,
+        "remaining_resident": 320,
+        "repeat_first_refused": 0,
+        "selected": 3696,
+        "upload_lower_bound_gib": 11.391,
+        "uploads": 864
+      },
+      "policy": "first",
+      "rate": 32
+    },
+    {
+      "capacity": 320,
+      "holdout": {
+        "evictions": 448,
+        "hit_fraction": 0.21402,
+        "hits": 791,
+        "opportunity": 2742,
+        "remaining_resident": 320,
+        "repeat_first_refused": 1615,
+        "selected": 3696,
+        "upload_lower_bound_gib": 10.125,
+        "uploads": 768
+      },
+      "policy": "repeat_gate",
+      "rate": 32
+    },
+    {
+      "capacity": 320,
+      "holdout": {
+        "evictions": 544,
+        "hit_fraction": 0.23404,
+        "hits": 865,
+        "opportunity": 2668,
+        "remaining_resident": 320,
+        "repeat_first_refused": 0,
+        "selected": 3696,
+        "upload_lower_bound_gib": 11.391,
+        "uploads": 864
+      },
+      "policy": "repeat_priority",
+      "rate": 32
+    },
+    {
+      "capacity": 320,
+      "holdout": {
+        "evictions": 448,
+        "hit_fraction": 0.21402,
+        "hits": 791,
+        "opportunity": 2742,
+        "remaining_resident": 320,
+        "repeat_first_refused": 1615,
+        "selected": 3696,
+        "upload_lower_bound_gib": 10.125,
+        "uploads": 768
+      },
+      "policy": "repeat_gate",
+      "rate": 32
+    }
+  ],
+  "holdout_forward_count": 9,
+  "holdout_sha256": "ff6fafb5a515eee6bbe29a2946e039829400c0f8932eb8f86092c333daa9a42b",
+  "holdout_summary": {
+    "events": 3696,
+    "repeated_selections": 2081,
+    "unique_layer_experts": 1615
+  },
+  "limits": "simulator is not native Vulkan tier: ignores admission heat gates, async upload stalls, CPU cache, pool fragmentation, and actual work latency",
+  "measured_native_tokens_per_second": false,
+  "no_future_expert_prediction": true,
+  "objective": "validation hits - 0.30 * uploads, cap <=320 experts and <=32 uploads/token",
+  "policy": "read-only causally replayed idealized GPU residency",
+  "schema": 1,
+  "validation_forward_count": 17,
+  "validation_sha256": "aab4f8bc9207d2cc614c5dbffe5cdcc9b3907a807413ebf9e6d2922a2b14f803",
+  "validation_summary": {
+    "events": 6384,
+    "repeated_selections": 3478,
+    "unique_layer_experts": 2906
+  },
+  "validation_top5": [
+    {
+      "capacity": 320,
+      "policy": "repeat_gate",
+      "rate": 32,
+      "validation": {
+        "evictions": 1143,
+        "hit_fraction": 0.21491,
+        "hits": 1372,
+        "opportunity": 4831,
+        "remaining_resident": 320,
+        "repeat_first_refused": 2906,
+        "selected": 6384,
+        "upload_lower_bound_gib": 19.288,
+        "uploads": 1463
+      }
+    },
+    {
+      "capacity": 320,
+      "policy": "repeat_priority",
+      "rate": 32,
+      "validation": {
+        "evictions": 1312,
+        "hit_fraction": 0.21805,
+        "hits": 1392,
+        "opportunity": 4811,
+        "remaining_resident": 320,
+        "repeat_first_refused": 0,
+        "selected": 6384,
+        "upload_lower_bound_gib": 21.516,
+        "uploads": 1632
+      }
+    },
+    {
+      "capacity": 320,
+      "policy": "balanced",
+      "rate": 32,
+      "validation": {
+        "evictions": 1312,
+        "hit_fraction": 0.21272,
+        "hits": 1358,
+        "opportunity": 4845,
+        "remaining_resident": 320,
+        "repeat_first_refused": 0,
+        "selected": 6384,
+        "upload_lower_bound_gib": 21.516,
+        "uploads": 1632
+      }
+    },
+    {
+      "capacity": 320,
+      "policy": "repeat_priority",
+      "rate": 16,
+      "validation": {
+        "evictions": 496,
+        "hit_fraction": 0.17278,
+        "hits": 1103,
+        "opportunity": 5100,
+        "remaining_resident": 320,
+        "repeat_first_refused": 0,
+        "selected": 6384,
+        "upload_lower_bound_gib": 10.758,
+        "uploads": 816
+      }
+    },
+    {
+      "capacity": 320,
+      "policy": "repeat_gate",
+      "rate": 16,
+      "validation": {
+        "evictions": 448,
+        "hit_fraction": 0.16917,
+        "hits": 1080,
+        "opportunity": 5123,
+        "remaining_resident": 320,
+        "repeat_first_refused": 2906,
+        "selected": 6384,
+        "upload_lower_bound_gib": 10.125,
+        "uploads": 768
+      }
+    }
+  ]
+}

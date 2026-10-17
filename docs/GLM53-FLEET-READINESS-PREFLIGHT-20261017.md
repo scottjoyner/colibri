@@ -46,9 +46,19 @@ missing GPU identity, swap usage, or memory pressure. Even when those
 numbers are otherwise acceptable, it **always** returns `decision=HOLD`.
 It cannot itself authorize execution.
 
-The failed prior Joyner full-model attempts have been read back from
-systemd: one timed out (exit 124), the other was OOM-killed. The
-current preflight does not override that negative operational evidence.
+Prior Joyner full-model attempts had mixed outcomes: a natural-prompt
+run timed out (exit 124), and another was OOM-killed; however a separate
+isolated full-checkpoint synthetic run DID complete eight greedy tokens in
+12.7 seconds (0.630 tok/s) with bounded dense staging, 6 GiB RAM cap,
+and `COLI_VK_UP_IMPORT=0`. That is proof of technical feasibility,
+NOT production dialogue, multi-tenant, p99 or memory headroom acceptance.
+The import-on A/B failed to complete under high memory PSI. See
+`docs/GLM53-REAL-INFERENCE-HOST-IMPORT-AB-20261017.md`.
+
+The preflight does not call the fleet registry: `production_model_loaded`
+and `fleet_admitted` are deliberately `null` (unknown), not false.
+Only actions *by this preflight* (server not started, model untouched,
+admission not modified) are positively asserted.
 
 ## Actual next experiment and release gates
 
