@@ -1,0 +1,127 @@
+{
+  "schema": 1,
+  "date": "2026-10-17",
+  "node": "joyner",
+  "pci_id": "1002:7551",
+  "driver": "RADV GFX1201",
+  "source_revision": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "sample_file": "model-00002-of-00062.safetensors",
+  "block_size_bytes": 4194304,
+  "direct_IO": true,
+  "memory_limit_bytes": 1073741824,
+  "swap_limit_bytes": 0,
+  "production_ports_unmodified": [
+    18320,
+    18321
+  ],
+  "negative_control": {
+    "result": "EFAULT",
+    "errno": 14,
+    "path": "O_DIRECT into Vulkan device-allocated mapped staging"
+  },
+  "external_host_import": {
+    "extension": "VK_EXT_external_memory_host",
+    "memory_type_index": 5,
+    "alignment_bytes": 4096,
+    "import_coherent": true
+  },
+  "correctness_mode": {
+    "verified_uploads_128": 128,
+    "verified_uploads_384": 384,
+    "failed_comparisons": 0,
+    "total_bytes_verified": 2147483648
+  },
+  "comparison": {
+    "short_128": {
+      "paired_trials": [
+        {
+          "trial": 1,
+          "baseline_GBps": 4.727,
+          "imported_host_GBps": 7.129,
+          "relative_gain_percent": 50.81,
+          "baseline_p99_read_ms": 1.404,
+          "imported_p99_read_ms": 0.745,
+          "baseline_p99_vulkan_ms": 0.625,
+          "imported_p99_vulkan_ms": 0.325
+        },
+        {
+          "trial": 2,
+          "baseline_GBps": 4.74,
+          "imported_host_GBps": 8.228,
+          "relative_gain_percent": 73.59,
+          "baseline_p99_read_ms": 1.58,
+          "imported_p99_read_ms": 0.595,
+          "baseline_p99_vulkan_ms": 0.579,
+          "imported_p99_vulkan_ms": 0.312
+        },
+        {
+          "trial": 3,
+          "baseline_GBps": 4.737,
+          "imported_host_GBps": 7.896,
+          "relative_gain_percent": 66.69,
+          "baseline_p99_read_ms": 1.428,
+          "imported_p99_read_ms": 0.632,
+          "baseline_p99_vulkan_ms": 0.586,
+          "imported_p99_vulkan_ms": 0.308
+        }
+      ],
+      "median_baseline_GBps": 4.737,
+      "median_imported_GBps": 7.896,
+      "median_gain_percent": 66.69
+    },
+    "long_384": {
+      "paired_trials": [
+        {
+          "trial": 1,
+          "baseline_GBps": 4.902,
+          "imported_host_GBps": 7.887,
+          "relative_gain_percent": 60.89,
+          "baseline_p99_read_ms": 0.652,
+          "imported_p99_read_ms": 0.654,
+          "baseline_p99_vulkan_ms": 0.268,
+          "imported_p99_vulkan_ms": 0.292
+        },
+        {
+          "trial": 2,
+          "baseline_GBps": 5.047,
+          "imported_host_GBps": 8.179,
+          "relative_gain_percent": 62.06,
+          "baseline_p99_read_ms": 0.753,
+          "imported_p99_read_ms": 0.619,
+          "baseline_p99_vulkan_ms": 0.271,
+          "imported_p99_vulkan_ms": 0.312
+        }
+      ],
+      "median_baseline_GBps": 4.974,
+      "median_imported_GBps": 8.033,
+      "median_gain_percent": 61.48
+    }
+  },
+  "sample_region_uniqueness": 384,
+  "hashes_sha256": {
+    "direct_verify_128.err": "bdafff95ce783b012a3011dc977366d981b6e47596e1aeaf220daa2463094004",
+    "imported_host_throughput_128.json": "0f71fc446ad97dfbe3088b36b481987a65d8cfe0639f185f2dee536087f40be7",
+    "imported_host_verify_128.json": "6ec4559deaa88715bbc53f12492d24840f2f2900572444a2700ff934ba49f129",
+    "imported_long_1_baseline.json": "9879e92792ce9b0a14f853bdf0d90075a410d3e0d1b29d1f66c5239bdce98d4d",
+    "imported_long_1_imported.json": "821deeff1ec4cab99c1b2424fe8e03c1b9fc8ea5cafe91cfd0cc075a924dc4a6",
+    "imported_long_2_baseline.json": "7201ccaec7bcbe116c8f084a5ce71bbff85a912c83f0eec7a68770be635e12da",
+    "imported_long_2_imported.json": "37574fb9d81e3006ebea4c3fff851ae6bafe6117768db896f2ef795746e38da9",
+    "imported_pair_1_baseline.json": "ed10c9dcf83c3bcc924c24fd002046725e2b3917f4b2f1c7fada29644de79f35",
+    "imported_pair_1_imported.json": "9f17bc66bc258a76e15f28cbf3410008fb5e86c222648253c9e4cdc4b241341c",
+    "imported_pair_2_baseline.json": "cac46e5a4f0b325995f28785544e843ffbb687436c0176443263abc921dd6e7b",
+    "imported_pair_2_imported.json": "7f79f7c1bb7ac2c9b46a4439bd861292ccaa570b5920a632328135e8be2cc4d1",
+    "imported_pair_3_baseline.json": "b735a45af8352931606a2dd1e3e7f60aff2019e462a572fa11b2ac7ad66b2758",
+    "imported_pair_3_imported.json": "ecf3ae0feca329a0149c0d3b0a848151e21da141cd716c6dd1191b28b8254b94",
+    "imported_verify_384.json": "b281b432fb78723021fc0bf4906aef8de9509c839f975bb0f17d350652327cfd",
+    "sample_384_unique.txt": "f7b5b575db35d3001b5e9b597f8187f549b12909da8ba17ab0ce0d3f0375d4db"
+  },
+  "limitations": [
+    "isolated hardware tests, not full GLM inference or token throughput",
+    "O_DIRECT bypasses Linux page cache, not SSD controller cache",
+    "throughput-mode checks final GPU output only; correctness-mode separately readbacks every transfer",
+    "all 384 longer-sample regions reside in one verified shard",
+    "no speculative expert prefetch, cache eviction or scheduling integration",
+    "short-duration tests without production concurrent load",
+    "extension-specific path; any other driver must be probed and tested"
+  ]
+}
