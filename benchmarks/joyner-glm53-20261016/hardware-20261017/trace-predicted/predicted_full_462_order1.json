@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "utc": "2026-10-17T14:25:12Z",
+  "source_pin": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "verified_shards": 62,
+  "indexed_real_expert_up_tensors": 12384,
+  "train_runs": [
+    "glm53_native_expert_trace_20261016_run01.jsonl",
+    "glm53_native_expert_trace_20261016_run02.jsonl",
+    "glm53_native_expert_trace_20261016_run03.jsonl",
+    "glm53_native_expert_trace_20261016_run04.jsonl"
+  ],
+  "heldout_run": "glm53_native_expert_trace_20261016_run06_v2.jsonl",
+  "heldout_sha256": "ff6fafb5a515eee6bbe29a2946e039829400c0f8932eb8f86092c333daa9a42b",
+  "rows": 462,
+  "read_window_bytes": 4194304,
+  "max_read_workers": 2,
+  "deadline_ms_assumed": 10.0,
+  "upload_GBps_assumed": 8.0,
+  "physical_io_enabled": true,
+  "comparison": [
+    {
+      "policy": "prior_token",
+      "rows": 462,
+      "candidates": 924,
+      "candidate_precision": 0.36039,
+      "selected_recall": 0.0901,
+      "cold_selected_upper_coverage": 0.09765,
+      "predicted_unknown_tier_reads": 920,
+      "physical_O_DIRECT_reads": 920,
+      "physical_O_DIRECT_GB": 3.8588,
+      "block_device_sector_read_delta_GB": 3.8588,
+      "physical_read_ms_p50": 2.134,
+      "physical_read_ms_p99": 2.418,
+      "two_reader_step_ms_p50": 2.677,
+      "two_reader_step_ms_p99": 3.081
+    },
+    {
+      "policy": "cross_layer",
+      "rows": 462,
+      "candidates": 924,
+      "candidate_precision": 0.41342,
+      "selected_recall": 0.10335,
+      "cold_selected_upper_coverage": 0.11056,
+      "predicted_unknown_tier_reads": 910,
+      "physical_O_DIRECT_reads": 910,
+      "physical_O_DIRECT_GB": 3.8168,
+      "block_device_sector_read_delta_GB": 3.8168,
+      "physical_read_ms_p50": 2.142,
+      "physical_read_ms_p99": 2.554,
+      "two_reader_step_ms_p50": 2.695,
+      "two_reader_step_ms_p99": 3.283
+    },
+    {
+      "policy": "fusion",
+      "rows": 462,
+      "candidates": 924,
+      "candidate_precision": 0.47294,
+      "selected_recall": 0.11824,
+      "cold_selected_upper_coverage": 0.12815,
+      "predicted_unknown_tier_reads": 920,
+      "physical_O_DIRECT_reads": 920,
+      "physical_O_DIRECT_GB": 3.8588,
+      "block_device_sector_read_delta_GB": 3.8588,
+      "physical_read_ms_p50": 2.15,
+      "physical_read_ms_p99": 2.335,
+      "two_reader_step_ms_p50": 2.701,
+      "two_reader_step_ms_p99": 3.026
+    }
+  ],
+  "limitations": [
+    "Independent synthetic-ID GLM traces, not general workload",
+    "Only 4MiB up_proj tensor windows read, NOT complete 14MiB routed expert",
+    "Physical shadow read is not a live expert prefetch or GPU upload",
+    "Linux O_DIRECT bypasses Linux page cache but not SSD controller cache",
+    "Read requests processed after all nominees frozen, not overlapped with live inference",
+    "Candidate benefit judged ex post from native route; no runtime speedup proven",
+    "SSD read p99 cannot validate speculative layer deadlines without real compute overlap"
+  ],
+  "production_changed": false
+}
