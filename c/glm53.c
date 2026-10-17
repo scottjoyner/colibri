@@ -63,6 +63,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>   /* fork opt-in: reclaimable file-backed dense staging */
+#endif
 #include <stdint.h>
 #include <stdarg.h>
 
@@ -674,6 +677,10 @@ typedef struct {
      * (g53_dho_reload); vk_gone = 1 while the device holds it alone */
     char *vk_name;
     int vk_kind, vk_gone;
+    /* Fork-only opt-in: mapped quantized matrix+scales in a private, unlinked
+     * file on a disk-backed filesystem. Never use free() on this mapping. */
+    void *spill_map;
+    size_t spill_len;
 } Mat;
 
 typedef struct {
@@ -912,6 +919,157 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
 #endif
 }
 
+/* Experimental bounded resident-matrix conversion (fork-only rollout).
+ * The historical loader holds the ENTIRE matrix as f32 plus a raw BF16/F16
+ * copy plus its final quantized form. On Joyner (14 GiB host, 32 GiB discrete
+ * VRAM) that peak can OOM before Vulkan initializes. This path holds only
+ * <=~2 MiB of f32 rows and <=~2 MiB raw rows at once.
+ *
+ * Quantization is row-local, and invokes the SAME functions as the legacy
+ * path; a row split never cuts a group of 64 columns. F32 resident matrices
+ * deliberately stay on the old path (they require full storage).
+ *
+ * The default is OFF until numerical and real-hardware validation pass.
+ * COLI_VK_DENSE_HOST remains independent: releasing persistent host copies
+ * during GPU placement is the next, separately tested slice.
+ */
+static int glm53_bounded_dense_enabled(void) {
+    const char *e = getenv("GLM53_BOUNDED_DENSE");
+    return e && !strcmp(e, "1");
+}
+
+static Mat glm53_bounded_quant_tensor(const st_tensor *t, int rows, int columns) {
+    if (!t || t->fd < 0 || t->off < 0 || rows <= 0 || columns <= 0 ||
+        t->rank != 2 || t->shape[0] != rows || t->shape[1] != columns ||
+        (int64_t)rows > INT64_MAX / columns || t->numel != (int64_t)rows * columns ||
+        (t->dtype != 0 && t->dtype != 1 && t->dtype != 2) ||
+        t->numel < 0 || t->numel > INT64_MAX / st_dtype_esz(t->dtype) ||
+        t->nbytes != t->numel * st_dtype_esz(t->dtype)) {
+        fprintf(stderr, "GLM53_BOUNDED_DENSE: invalid dense tensor geometry or dtype\n");
+        exit(1);
+    }
+    const int bits = glm53_dense_bits();
+    if (bits == 32) {
+        fprintf(stderr, "GLM53_BOUNDED_DENSE: GLM53_BITS=32 is not a bounded quant path\n");
+        exit(1);
+    }
+    const int gs64 = bits == 4 && columns % 64 == 0;
+    const size_t elements = (size_t)rows * (size_t)columns;
+    const size_t row_bytes = (size_t)columns * sizeof(float);
+    if (elements > SIZE_MAX / sizeof(float) || row_bytes > SIZE_MAX / 64 ||
+        t->off > INT64_MAX - t->nbytes) {
+        fprintf(stderr, "GLM53_BOUNDED_DENSE: dense tensor size overflow\n");
+        exit(1);
+    }
+
+    Mat out; memset(&out, 0, sizeof(out));
+    out.rows = rows; out.columns = columns; out.resident = 1;
+    uint8_t *packed = NULL;
+    int8_t *levels = NULL;
+    float *scales = NULL;
+    const size_t packed_bytes = gs64 ? elements / 2 : elements;
+    const size_t scales_bytes = gs64
+        ? (size_t)rows * ((size_t)columns / 64) * sizeof(float)
+        : (size_t)rows * sizeof(float);
+    const char *spill_dir = getenv("GLM53_DENSE_SPILL_DIR");
+#if defined(_WIN32)
+    if (spill_dir && *spill_dir) {
+        fprintf(stderr, "GLM53_DENSE_SPILL_DIR: POSIX mapped staging is unavailable on Windows\\n");
+        exit(1);
+    }
+#else
+    if (spill_dir && *spill_dir) {
+        if (*spill_dir != '/' || strlen(spill_dir) > 2048 ||
+            packed_bytes > SIZE_MAX - scales_bytes - 4096) {
+            fprintf(stderr, "GLM53_DENSE_SPILL_DIR: invalid absolute path or size overflow\n");
+            exit(1);
+        }
+        char path[2304];
+        snprintf(path, sizeof(path), "%s/glm53-XXXXXX", spill_dir);
+        int fd = mkstemp(path);    /* 0600, O_CREAT | O_EXCL */
+        if (fd < 0) {
+            perror("GLM53_DENSE_SPILL_DIR mkstemp");
+            exit(1);
+        }
+        const size_t at = (packed_bytes + 4095) & ~(size_t)4095;
+        const size_t size = at + scales_bytes;
+        if (ftruncate(fd, (off_t)size) != 0) {
+            perror("GLM53_DENSE_SPILL_DIR ftruncate");
+            close(fd); unlink(path); exit(1);
+        }
+        void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) {
+            perror("GLM53_DENSE_SPILL_DIR mmap");
+            close(fd); unlink(path); exit(1);
+        }
+        /* Do not expose incomplete matrices and leave no artifact on crash.
+         * The inode lives until the matrix is unloaded. */
+        if (unlink(path) != 0) {
+            perror("GLM53_DENSE_SPILL_DIR unlink");
+            munmap(map, size); close(fd); exit(1);
+        }
+        close(fd);
+        out.spill_map = map; out.spill_len = size;
+        if (gs64) packed = map;
+        else levels = map;
+        scales = (float *)((char *)map + at);
+    } else
+#endif
+    {
+        if (gs64) packed = malloc(packed_bytes);
+        else levels = malloc(packed_bytes);
+        scales = malloc(scales_bytes);
+        if ((!packed && !levels) || !scales)
+            coli_load_fail(COLI_LOAD_FAIL_NOMEM, "bounded GLM53 quant output allocation");
+    }
+    if (gs64) { out.fmt = 4; out.gs = 64; out.q4 = packed; }
+    else { out.fmt = 1; out.q8 = levels; }
+    out.s = scales;
+
+    size_t chunk = (2u << 20) / row_bytes; /* <=2 MiB f32 staging */
+    if (!chunk) chunk = 1;
+    if (chunk > 64) chunk = 64;
+    if (chunk > (size_t)rows) chunk = (size_t)rows;
+    const size_t chunk_elems = chunk * (size_t)columns;
+    const int esz = st_dtype_esz(t->dtype);
+    float *decoded = malloc(chunk_elems * sizeof(float));
+    void *raw = malloc(chunk_elems * (size_t)esz);
+    if (!decoded || !raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "bounded GLM53 staging allocation");
+
+    for (int at = 0; at < rows; at += (int)chunk) {
+        const int n = at + (int)chunk > rows ? rows - at : (int)chunk;
+        const size_t elems = (size_t)n * (size_t)columns;
+        const int64_t offset = t->off + (int64_t)at * columns * esz;
+        st_pread_full(t->fd, raw, elems * (size_t)esz, offset, "bounded GLM53 dense read");
+        if (t->dtype == 2) memcpy(decoded, raw, elems * sizeof(float));
+        else if (t->dtype == 0) bf16_to_f32_bulk((const uint16_t *)raw, decoded, (int64_t)elems);
+        else f16_to_f32_bulk((const uint16_t *)raw, decoded, (int64_t)elems);
+
+        if (gs64) {
+            quantize_i4_grouped(decoded,
+                packed + (size_t)at * ((size_t)columns / 2),
+                scales + (size_t)at * ((size_t)columns / 64), n, columns, 64);
+        } else {
+            quantize_rows(decoded, levels + (size_t)at * columns, scales + at,
+                n, columns, 8);
+        }
+    }
+    free(raw);
+    free(decoded);
+#if !defined(_WIN32)
+    if (out.spill_map) {
+        if (msync(out.spill_map, out.spill_len, MS_SYNC) != 0 ||
+            mprotect(out.spill_map, out.spill_len, PROT_READ) != 0 ||
+            madvise(out.spill_map, out.spill_len, MADV_DONTNEED) != 0) {
+            perror("GLM53_DENSE_SPILL_DIR sync/protect/reclaim");
+            exit(1);
+        }
+    }
+#endif
+    posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+    return out;
+}
+
 /* rows x columns e' la forma con cui il forward usa la matrice, contata dalla
  * config: mm() scrive w->rows valori per token e ne legge w->columns. Presa
  * dall'header senza confronto, una riga in piu' scriveva oltre il buffer
@@ -988,17 +1146,36 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
                 (long long)rows, (long long)columns);
         exit(1);
     }
-    float *buffer = malloc((size_t)t->numel * sizeof(float));
-    if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
-    st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
-    mat.rows = (int)rows;
-    mat.columns = (int)columns;
-
-    mat = quantize_loaded(buffer, mat.rows, mat.columns);
+    if (glm53_bounded_dense_enabled() && glm53_dense_bits() != 32) {
+        mat = glm53_bounded_quant_tensor(t, (int)rows, (int)columns);
+    } else {
+        float *buffer = malloc((size_t)t->numel * sizeof(float));
+        if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+        st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
+        mat.rows = (int)rows;
+        mat.columns = (int)columns;
+        mat = quantize_loaded(buffer, mat.rows, mat.columns);
+    }
 #ifdef COLI_VULKAN
     if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
 #endif
     return mat;
+}
+
+/* An mmap result needs exactly one munmap, never four free calls. The
+ * unconditional helper also covers device-loss reloads and full model exit. */
+static void glm53_matrix_host_release(Mat *w) {
+#if !defined(_WIN32)
+    if (w->spill_map) {
+        munmap(w->spill_map, w->spill_len);
+        w->spill_map = NULL; w->spill_len = 0;
+    } else
+#endif
+    {
+        free((void *)w->f); free((void *)w->q8);
+        free((void *)w->q4); free((void *)w->s);
+    }
+    w->f = NULL; w->q8 = NULL; w->q4 = NULL; w->s = NULL;
 }
 
 #ifdef COLI_VULKAN
@@ -1040,6 +1217,7 @@ static void g53_dho_reload(Mat *w) {
             exit(1);
         }
         w->f = n.f; w->q8 = n.q8; w->q4 = n.q4; w->s = n.s;
+        w->spill_map = n.spill_map; w->spill_len = n.spill_len;
         free(n.vk_name);
         __atomic_store_n(&w->vk_gone, 0, __ATOMIC_RELEASE);
         coli_vk_dense_host_reloaded(g53_host_bytes(w));
@@ -1998,11 +2176,11 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, NULL, 0 },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, NULL, 0 },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0 },
+          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0, NULL, 0 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -2424,8 +2602,7 @@ static int g53_dho_drop(Mat *w, int keep, int drop, size_t *bytes) {
     if (!coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, p, w->fmt ? w->s : NULL, g53_vk_fmt(w), w->columns, w->rows,
                                w->fmt == 4 ? w->gs : 0)) return 0;
     const size_t b = g53_host_bytes(w);
-    free((void *)w->f); free((void *)w->q8); free((void *)w->q4); free((void *)w->s);
-    w->f = NULL; w->q8 = NULL; w->q4 = NULL; w->s = NULL;
+    glm53_matrix_host_release(w);
     __atomic_store_n(&w->vk_gone, 1, __ATOMIC_RELEASE);
     coli_vk_dense_host_dropped(b);
     *bytes += b;
@@ -2940,8 +3117,7 @@ static void mat_release(Mat *mat) {
 #ifdef COLI_VULKAN
     if (mat->vk) coli_vk_tensor_free((ColiVkTensor *)mat->vk);
 #endif
-    free((void *)mat->f); free((void *)mat->q8);
-    free((void *)mat->q4); free((void *)mat->s);
+    glm53_matrix_host_release(mat);
     memset(mat, 0, sizeof(*mat));
 }
 

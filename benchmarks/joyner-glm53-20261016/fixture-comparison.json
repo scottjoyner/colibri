@@ -1,0 +1,105 @@
+{
+  "branch_commit": "abf2aad",
+  "host": "joyner",
+  "kind": "CPU fixture A/B",
+  "model": "GLM-5.3 synthetic fixture, not real checkpoint",
+  "total_cases": 6,
+  "results": [
+    {
+      "fixture": "glm53_stream-i4",
+      "bits": 4,
+      "agreement": {
+        "teacher_forcing": true,
+        "greedy": true,
+        "last_logits": true
+      },
+      "baseline_elapsed_s": 0.007,
+      "bounded_elapsed_s": 0.131,
+      "sha256": {
+        "teacher_forcing": "5a5c6fb49625847561309e1523ead68c1e8b7da1c77c3abd5e3751f587c823a0",
+        "last_logits": "9ac0d4d503ede6ac4aec927e9d2f5f380f3d4090fe6478192387a1c7102f471e",
+        "greedy": "80e6f6ee02531f2b5bdb5fb2f593aa63c1a5d44c948f06493cf7d3efc493ec94"
+      }
+    },
+    {
+      "fixture": "glm53_stream-i4",
+      "bits": 8,
+      "agreement": {
+        "teacher_forcing": true,
+        "greedy": true,
+        "last_logits": true
+      },
+      "baseline_elapsed_s": 0.005,
+      "bounded_elapsed_s": 0.121,
+      "sha256": {
+        "teacher_forcing": "28ebb8cb743c6ba71fca15718c79783d6c2a803537e2753a6bbb2fcb49f82be7",
+        "last_logits": "63425b40fd628ba8d2015945b3441ca357581b1639d5faaac3aed318a712fb10",
+        "greedy": "6f6b78c7769567427b41eaddb5020816a948ff2ecc8ca8f50c5047b40d313b0f"
+      }
+    },
+    {
+      "fixture": "glm53_stream-deq",
+      "bits": 4,
+      "agreement": {
+        "teacher_forcing": true,
+        "greedy": true,
+        "last_logits": true
+      },
+      "baseline_elapsed_s": 0.008,
+      "bounded_elapsed_s": 0.158,
+      "sha256": {
+        "teacher_forcing": "5a5c6fb49625847561309e1523ead68c1e8b7da1c77c3abd5e3751f587c823a0",
+        "last_logits": "9ac0d4d503ede6ac4aec927e9d2f5f380f3d4090fe6478192387a1c7102f471e",
+        "greedy": "80e6f6ee02531f2b5bdb5fb2f593aa63c1a5d44c948f06493cf7d3efc493ec94"
+      }
+    },
+    {
+      "fixture": "glm53_stream-deq",
+      "bits": 8,
+      "agreement": {
+        "teacher_forcing": true,
+        "greedy": true,
+        "last_logits": true
+      },
+      "baseline_elapsed_s": 0.007,
+      "bounded_elapsed_s": 0.151,
+      "sha256": {
+        "teacher_forcing": "28ebb8cb743c6ba71fca15718c79783d6c2a803537e2753a6bbb2fcb49f82be7",
+        "last_logits": "63e232b2eb10cb0cc82fcaf222b78e87a8388987d7a03b744b81aafe2d7ce3a9",
+        "greedy": "6f6b78c7769567427b41eaddb5020816a948ff2ecc8ca8f50c5047b40d313b0f"
+      }
+    },
+    {
+      "fixture": "glm53_mm_tiny",
+      "bits": 4,
+      "agreement": {
+        "teacher_forcing": true,
+        "greedy": true,
+        "last_logits": true
+      },
+      "baseline_elapsed_s": 0.008,
+      "bounded_elapsed_s": 0.154,
+      "sha256": {
+        "teacher_forcing": "5a5c6fb49625847561309e1523ead68c1e8b7da1c77c3abd5e3751f587c823a0",
+        "last_logits": "9ac0d4d503ede6ac4aec927e9d2f5f380f3d4090fe6478192387a1c7102f471e",
+        "greedy": "80e6f6ee02531f2b5bdb5fb2f593aa63c1a5d44c948f06493cf7d3efc493ec94"
+      }
+    },
+    {
+      "fixture": "glm53_mm_tiny",
+      "bits": 8,
+      "agreement": {
+        "teacher_forcing": true,
+        "greedy": true,
+        "last_logits": true
+      },
+      "baseline_elapsed_s": 0.006,
+      "bounded_elapsed_s": 0.15,
+      "sha256": {
+        "teacher_forcing": "28ebb8cb743c6ba71fca15718c79783d6c2a803537e2753a6bbb2fcb49f82be7",
+        "last_logits": "26949a724185d9f2c3db38389da0be00982e73e7c419209e25d1d0b7608bbc44",
+        "greedy": "6f6b78c7769567427b41eaddb5020816a948ff2ecc8ca8f50c5047b40d313b0f"
+      }
+    }
+  ]
+}
