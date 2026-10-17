@@ -38,6 +38,8 @@ MAX_SECONDS_PER_RUN = 100.0
 RECENT_PSI_OBSERVATIONS = 2
 PORTS = (18320,18321)
 TARGET = "100.83.215.83"
+BENCH_COMPETITOR_UNITS = ("fleet-r9700-vulkan-canary.service",
+                          "fleet-r9700-toolcall.service")
 
 def check_endpoint(port:int):
     conn=http.client.HTTPConnection(TARGET,port,timeout=3)
@@ -82,7 +84,25 @@ def pressure_violation(reading):
         return "gpu_vram_floor"
     return None
 
-def validate(binary:Path,output:Path):
+def unit_active(unit:str)->bool:
+    p=subprocess.run(["systemctl","--user","is-active","--quiet",unit],
+                     capture_output=True)
+    return p.returncode==0
+
+def competition_violation(*,isolated:bool)->str|None:
+    """Don't probe intentionally stopped endpoints during an exclusive run."""
+    if isolated:
+        return ("competing_service_restarted"
+                if any(unit_active(u) for u in BENCH_COMPETITOR_UNITS)
+                else None)
+    try:
+        return ("production_health_lost"
+                if not all(check_endpoint(port) for port in PORTS)
+                else None)
+    except Exception:
+        return "production_health_check_failed"
+
+def validate(binary:Path,output:Path,*,isolated:bool=False):
     if os.uname().nodename!="joyner":raise RuntimeError("NO_GO not Joyner")
     if not binary.is_file() or not os.access(binary,os.X_OK):raise RuntimeError("NO_GO binary absent")
     if not MODEL.is_dir() or MODEL.is_symlink():raise RuntimeError("NO_GO checkpoint missing")
@@ -98,10 +118,15 @@ def validate(binary:Path,output:Path):
     if os.geteuid()==0:raise RuntimeError("NO_GO refuse root")
     if pressure()["mem_available_kib"]<3500000:
         raise RuntimeError("NO_GO Joyner has insufficient initial RAM headroom")
-    for port in PORTS:
-        if not check_endpoint(port):raise RuntimeError("NO_GO unhealthy existing inference endpoint")
+    if isolated:
+        if any(unit_active(u) for u in BENCH_COMPETITOR_UNITS):
+            raise RuntimeError("NO_GO benchmark competitors still active")
+    else:
+        for port in PORTS:
+            if not check_endpoint(port):
+                raise RuntimeError("NO_GO unhealthy existing inference endpoint")
 
-def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:int,text_only:int,fair_layers:int,expert_gb:float):
+def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:int,text_only:int,fair_layers:int,expert_gb:float,*,isolated:bool=False):
     unit="glm53-tier-ab-"+uuid.uuid4().hex[:12]
     logfile=output.parent/(label+".log")
     metrics=output.parent/(label+"_pressure.jsonl")
@@ -136,7 +161,7 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
     events=[]
     bad_streak=0
     start=time.monotonic()
-    result={"mode":label,"tier_gib":tier,"rate":rate,"dense_host":dense_host,"text_only":text_only,"fair_layers":fair_layers,"expert_gb":expert_gb,"unit":unit,"binary_sha256":
+    result={"mode":label,"tier_gib":tier,"rate":rate,"dense_host":dense_host,"text_only":text_only,"fair_layers":fair_layers, "expert_gb":expert_gb,"isolated":isolated,"unit":unit,"binary_sha256":
              hashlib.sha256(binary.read_bytes()).hexdigest(),"completed":False}
     with logfile.open("x") as logs,metrics.open("x") as samples:
         p=subprocess.Popen(cmd,stdout=logs,stderr=subprocess.STDOUT,
@@ -155,11 +180,8 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
                 if elapsed>MAX_SECONDS_PER_RUN:
                     result["stop_reason"]="watchdog_wall_limit"
                 if int(elapsed)%4==0:
-                    try:
-                        if not all(check_endpoint(port) for port in PORTS):
-                            result["stop_reason"]="production_health_lost"
-                    except Exception:
-                        result["stop_reason"]="production_health_check_failed"
+                    violation=competition_violation(isolated=isolated)
+                    if violation:result["stop_reason"]=violation
                 if result.get("stop_reason"):
                     subprocess.run(["systemctl","--user","stop",unit+".scope"],
                                    capture_output=True,timeout=10)
@@ -222,11 +244,13 @@ def main():
     pa.add_argument("--out-dir",required=True,type=Path)
     pa.add_argument("--tier-gib",required=True,type=float)
     pa.add_argument("--rate",required=True,type=int)
-    pa.add_argument("--label",required=True,choices=("baseline2","dense_host0","textonly2","textonly4","textonly8","textonly4control","textonly4fair","textonly8fair","textonly4faircache2"))
+    pa.add_argument("--label",required=True,choices=("baseline2","dense_host0","textonly2","textonly4","textonly8","textonly4control","textonly4fair","textonly8fair","textonly4faircache2","exclusive4control","exclusive4fair","exclusive4control2","exclusive4fair2"))
     pa.add_argument("--dense-host",required=True,type=int,choices=(0,1))
     pa.add_argument("--text-only",required=True,type=int,choices=(0,1))
     pa.add_argument("--fair-layers",type=int,default=0,choices=(0,1))
     pa.add_argument("--expert-gb",type=float,default=0.05)
+    pa.add_argument("--isolated",action="store_true",
+                    help="Require both competing R9700 canaries already stopped by exclusive wrapper")
     a=pa.parse_args()
     allowed={(2.0,16,1,0,0,"baseline2"),(2.0,16,0,0,0,"dense_host0"),
              (2.0,16,0,1,0,"textonly2"),(4.0,32,0,1,0,"textonly4"),
@@ -234,20 +258,30 @@ def main():
              (4.0,32,0,1,0,"textonly4control"),
              (4.0,32,0,1,1,"textonly4fair"),
              (8.0,32,0,1,1,"textonly8fair"),
-             (4.0,32,0,1,1,"textonly4faircache2")}
+             (4.0,32,0,1,1,"textonly4faircache2"),
+             (4.0,32,0,1,0,"exclusive4control"),
+             (4.0,32,0,1,1,"exclusive4fair"),
+             (4.0,32,0,1,0,"exclusive4control2"),
+             (4.0,32,0,1,1,"exclusive4fair2")}
     if (a.tier_gib,a.rate,a.dense_host,a.text_only,a.fair_layers,a.label) not in allowed:
         raise SystemExit("NO_GO only pinned tier+dense+vision+fair placements")
     if a.expert_gb != (1.25 if a.label=="textonly4faircache2" else 0.05):
         raise SystemExit("NO_GO non-pinned CPU expert-cache budget")
     report=a.out_dir/(a.label+".json")
-    validate(a.binary,report)
-    r=run_trial(a.binary,report,a.label,a.tier_gib,a.rate,a.dense_host,a.text_only,a.fair_layers,a.expert_gb)
+    validate(a.binary,report,isolated=a.isolated)
+    r=run_trial(a.binary,report,a.label,a.tier_gib,a.rate,a.dense_host,a.text_only,a.fair_layers,a.expert_gb,
+                isolated=a.isolated)
     print(json.dumps(r,sort_keys=True),flush=True)
     if not r["completed"]:sys.exit(15)
-    for port in PORTS:
-        if not check_endpoint(port):
-            print("NO_GO post-run endpoint unavailable",file=sys.stderr)
+    if a.isolated:
+        if any(unit_active(u) for u in BENCH_COMPETITOR_UNITS):
+            print("NO_GO post-run competition returned",file=sys.stderr)
             sys.exit(17)
+    else:
+        for port in PORTS:
+            if not check_endpoint(port):
+                print("NO_GO post-run endpoint unavailable",file=sys.stderr)
+                sys.exit(17)
 
 if __name__=="__main__":
     try:main()

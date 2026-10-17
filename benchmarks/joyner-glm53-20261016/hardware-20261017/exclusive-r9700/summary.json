@@ -1,0 +1,16 @@
+{
+  "baseline": "exclusive4control2",
+  "binary_sha256": "7107c88241266da8bfcbb7ba82683dc93b4bca53ee7fd54584d2813f5ca247d1",
+  "candidate": "exclusive4fair2",
+  "exact_output_parity": true,
+  "expert_miss_decrease": 153,
+  "gpu_served_increase_percent": 35.17,
+  "max_psi_full_avg10": 0,
+  "mode": "exclusive_r9700_native_full_glm_ab",
+  "runs": 2,
+  "schema": 1,
+  "services_restored": true,
+  "single_pair_not_statistical": true,
+  "throughput_increase_percent": 7.18,
+  "upload_decrease": 56
+}
