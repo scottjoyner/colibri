@@ -1,0 +1,5 @@
+{"mode":"six","experts":37,"read_calls":222,"p50_ms":3.356,"p95_ms":4.425,"p99_ms":15.339,"all_six_tensor_hashes_match":true}
+{"mode":"grouped","experts":37,"read_calls":42,"p50_ms":3.614,"p95_ms":4.188,"p99_ms":4.348,"all_six_tensor_hashes_match":true}
+{"mode":"grouped","experts":37,"read_calls":42,"p50_ms":3.598,"p95_ms":4.144,"p99_ms":4.352,"all_six_tensor_hashes_match":true}
+{"mode":"six","experts":37,"read_calls":222,"p50_ms":3.598,"p95_ms":4.492,"p99_ms":4.530,"all_six_tensor_hashes_match":true}
+PASS native buffered read 4-pass exact tensor checks

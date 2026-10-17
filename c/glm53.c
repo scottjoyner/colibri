@@ -73,6 +73,8 @@
 #include "json.h"
 #include "stop_ids.h"
 #include "st.h"
+#include "glm53_expert_read_plan.h"
+#include "glm53_expert_preadv.h"
 #include "quant.h"
 #include "tok.h"
 #include "omp_tune.h"
@@ -744,6 +746,7 @@ typedef struct {
     struct LCache *ecache;
     int64_t e_len[6], e_at[6], e_slot;
     uint64_t clock, ebytes;
+    uint64_t e_grouped_experts, e_grouped_calls;
     long hits, miss;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
@@ -1632,6 +1635,10 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
 static int g_cap_override = 0;
 
 #define GLM53_EXPERT_PIECES 6
+/* 0 = legacy (default), 1 = coalesce physical slab, 2 = force physical,
+ * 3 = preadv scatter into logical slab, 4 = force preadv even with mmap.
+ * All variants are experimental and disabled by default. */
+static int g53_coalesce_mode;
 
 typedef struct ERef {
     int fd[GLM53_EXPERT_PIECES];
@@ -1673,6 +1680,17 @@ static void expert_geometry(GModel *m) {
  * modello, e leggerlo lo stesso vorrebbe dire calcolare su byte a caso. */
 static void expert_table_init(GModel *m) {
     const Cfg *c = &m->c;
+    const char *grouped = getenv("GLM53_COALESCED_EXPERT_IO");
+    g53_coalesce_mode = (grouped && strcmp(grouped,"1")==0) ? 1 :
+                        (grouped && strcmp(grouped,"force")==0) ? 2 :
+#if defined(__linux__)
+                        (grouped && strcmp(grouped,"vector")==0) ? 3 :
+                        (grouped && strcmp(grouped,"force-vector")==0) ? 4 :
+#endif
+                        0;
+    if (getenv("GLM53_VERBOSE") && g53_coalesce_mode)
+        fprintf(stderr,"[GLM53 IO] experimental six-tensor coalescing ON (mode %d); mmap unchanged unless force\n",
+                g53_coalesce_mode);
     static const char *piece[GLM53_EXPERT_PIECES] = {
         "gate_proj.weight", "gate_proj.weight.qs",
         "up_proj.weight",   "up_proj.weight.qs",
@@ -2168,6 +2186,80 @@ static int glm53_expert_read_replica(GModel *m, const ERef *ref, int layer, int 
     return rep;
 }
 
+/* The indexed tensor definitions are authoritative. Build a run list using
+ * the SELECTED full-expert replica, never mixing primary/mirror files.
+ * Reuse the already reserved slot: packed reads remap piece pointers, whereas
+ * preadv scatters into canonical logical offsets. Neither allocates a second
+ * 13.5MiB scratch buffer. The planner refuses overlap and overflow. */
+static void glm53_expert_read_grouped(GModel *m, const ERef *ref, int rep, Slot *slot) {
+    int fd[G53_IO_PIECES];
+    G53IOplan plan;
+    for (int p=0;p<G53_IO_PIECES;p++) {
+        if (st_fidx(&m->S, ref->fd[p])<0) {
+            fprintf(stderr,"[GLM53 IO] NO_GO unindexed expert shard\n");exit(1);
+        }
+        fd[p] = rep>0 ? st_fd_rep(&m->S,ref->fd[p],rep) : ref->fd[p];
+        if (fd[p]<0) {
+            fprintf(stderr,"[GLM53 IO] NO_GO incomplete mirror\n");exit(1);
+        }
+    }
+    if (!g53_io_plan(fd,ref->off,m->e_len,(size_t)m->e_slot,&plan)) {
+        fprintf(stderr,"[GLM53 IO] NO_GO malformed six-tensor extent layout\n");exit(1);
+    }
+    unsigned int calls=0;
+    for (int i=0;i<plan.nruns;i++) {
+        const G53IOrun *r=&plan.run[i];
+        struct stat st;
+        if (fstat(r->fd,&st)!=0 || r->off>st.st_size ||
+            r->len>st.st_size-r->off || r->dest>(size_t)m->e_slot ||
+            (uint64_t)r->len>(size_t)m->e_slot-r->dest) {
+            fprintf(stderr,"[GLM53 IO] NO_GO source descriptor/file bounds\n");exit(1);
+        }
+#if defined(__linux__)
+        if(g53_coalesce_mode>=3) {
+            int order[6]={0,1,2,3,4,5};
+            for(int k=1;k<6;k++){
+                int p=order[k],j=k;
+                while(j>0 && plan.piece_dest[order[j-1]]>plan.piece_dest[p]){
+                    order[j]=order[j-1];j--;
+                }
+                order[j]=p;
+            }
+            struct iovec iov[6];
+            int count=0;size_t packed=0;
+            for(int k=0;k<6;k++){
+                int p=order[k];
+                size_t pos=plan.piece_dest[p];
+                if(pos<r->dest || pos>=r->dest+(size_t)r->len)continue;
+                if(pos!=r->dest+packed || packed+(size_t)m->e_len[p]>(size_t)r->len){
+                    fprintf(stderr,"[GLM53 IO] NO_GO scattered extent mismatch\n");exit(1);
+                }
+                iov[count++]=(struct iovec){slot->own+m->e_at[p],(size_t)m->e_len[p]};
+                packed+=(size_t)m->e_len[p];
+            }
+            if(packed!=(size_t)r->len || !g53_preadv_full(r->fd,iov,count,r->off,
+                                                          (size_t)r->len,&calls)){
+                fprintf(stderr,"[GLM53 IO] NO_GO incomplete native preadv\n");exit(1);
+            }
+        } else
+#endif
+        {
+            st_pread_full(r->fd,slot->own+r->dest,r->len,r->off,"grouped expert");
+            calls++;
+        }
+    }
+    for (int p=0;p<G53_IO_PIECES;p++)
+        slot->piece[p]=slot->own+(g53_coalesce_mode>=3 ? (size_t)m->e_at[p] : plan.piece_dest[p]);
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    m->e_grouped_experts++;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    m->e_grouped_calls+=calls;
+}
+
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
     int metal_slot = 0;
@@ -2182,7 +2274,7 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
      * 16-KiB-aligned base, so those views cannot be registered safely.
      * Metal-active slots therefore own one stable aligned slab; CPU-only runs
      * retain the zero-copy mmap fast path, using the selected replica. */
-    if (!metal_slot) {
+    if (!metal_slot && g53_coalesce_mode != 2 && g53_coalesce_mode != 4) {
         int mapped_ok = 1;
         for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
             int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
@@ -2230,7 +2322,9 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
         slot->piece[p] = slot->own + m->e_at[p];
 
-    if (ref->contig) {
+    if (g53_coalesce_mode) {
+        glm53_expert_read_grouped(m,ref,rep,slot);
+    } else if (ref->contig) {
         int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[0], rep) : ref->fd[0];
         st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
     } else {
@@ -4955,9 +5049,14 @@ int main(int argc, char **argv) {
     if (has_tokenizer) tok_free(&tokenizer);
     /* Contatori della cache esperti: servono a un test per accorgersi se lo
      * streaming e' stato aggirato invece che esercitato. */
-    if (model.streaming)
+    if (model.streaming) {
         printf("experts hits %ld miss %ld bytes %llu\n",
                model.hits, model.miss, (unsigned long long)model.ebytes);
+        if (g53_coalesce_mode)
+            printf("grouped experts %llu calls %llu\n",
+                   (unsigned long long)model.e_grouped_experts,
+                   (unsigned long long)model.e_grouped_calls);
+    }
 #ifdef COLI_VULKAN
     glm53_vk_report(&model, "run");
     g53c_report();
