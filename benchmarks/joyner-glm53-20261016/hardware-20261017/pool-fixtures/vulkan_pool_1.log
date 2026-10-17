@@ -1,0 +1,273 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 32624 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] ready: AMD Radeon Graphics (RADV GFX1201), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.5 MiB = 20 experts of 73.8 KiB (fmt 1, down fmt 1), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.6 MiB = 20 experts of 81.0 KiB (fmt 13 gs 32, down fmt 13 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 773.9 KiB = 20 experts of 37.8 KiB (fmt 2, down fmt 2), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.1 MiB = 20 experts of 54.0 KiB (fmt 4 gs 64, down fmt 13 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 773.9 KiB = 20 experts of 37.8 KiB (fmt 2, down fmt 2), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 922.5 KiB = 20 experts of 45.0 KiB (fmt 4 gs 32, down fmt 4 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 773.9 KiB = 20 experts of 37.8 KiB (fmt 2, down fmt 2), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 830.2 KiB = 20 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 830.2 KiB = 20 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 645.8 KiB = 20 experts of 31.5 KiB (fmt 5, down fmt 5), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 922.5 KiB = 20 experts of 45.0 KiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 922.5 KiB = 20 experts of 45.0 KiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.6 MiB = 20 experts of 81.0 KiB (fmt 12 gs 32, down fmt 12 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.5 MiB = 20 experts of 74.8 KiB (fmt 12 gs 128, down fmt 12 gs 128), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 2.9 MiB = 20 experts of 144.8 KiB (fmt 11, down fmt 11), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 5.8 MiB = 20 experts of 288.8 KiB (fmt 10, down fmt 10), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 2.0 MiB = 20 experts of 98.0 KiB (fmt 1, down fmt 1), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 2.0 MiB = 16 experts of 98.0 KiB (fmt 1, down fmt 1), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 1 streamed, 1 kept on the CPU (4 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 441.0 KiB = 2 experts of 98.0 KiB (fmt 1, down fmt 1), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 2 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 7 streamed, 2 kept on the CPU (10 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 7 streamed, 2 kept on the CPU (8 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 8 streamed, 1 kept on the CPU (4 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 7 streamed, 2 kept on the CPU (8 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 7 streamed, 2 kept on the CPU (10 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 8 streamed, 1 kept on the CPU (5 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 2.0 MiB = 20 experts of 98.0 KiB (fmt 1, down fmt 1), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.0 MiB = 20 experts of 50.0 KiB (fmt 2, down fmt 2), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.0 MiB = 16 experts of 50.0 KiB (fmt 2, down fmt 2), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 0 streamed, 2 kept on the CPU (10 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 1 streamed, 1 kept on the CPU (3 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 1 streamed, 1 kept on the CPU (5 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 225.0 KiB = 2 experts of 50.0 KiB (fmt 2, down fmt 2), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 2 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 6 streamed, 3 kept on the CPU (11 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 6 streamed, 3 kept on the CPU (10 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 5 streamed, 4 kept on the CPU (16 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 7 streamed, 2 kept on the CPU (7 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 8 streamed, 1 kept on the CPU (4 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.0 MiB = 20 experts of 50.0 KiB (fmt 2, down fmt 2), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.1 MiB = 20 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.1 MiB = 16 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 243.0 KiB = 2 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 2 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 6 streamed, 3 kept on the CPU (15 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 7 streamed, 2 kept on the CPU (7 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 7 streamed, 2 kept on the CPU (8 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 7 streamed, 2 kept on the CPU (10 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.1 MiB = 20 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.2 MiB = 20 experts of 60.0 KiB (fmt 4 gs 32, down fmt 4 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.2 MiB = 16 experts of 60.0 KiB (fmt 4 gs 32, down fmt 4 gs 32), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 1 streamed, 1 kept on the CPU (5 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 1 streamed, 1 kept on the CPU (5 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 1 streamed, 1 kept on the CPU (3 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 270.0 KiB = 2 experts of 60.0 KiB (fmt 4 gs 32, down fmt 4 gs 32), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 2 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 5 streamed, 4 kept on the CPU (17 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 7 streamed, 2 kept on the CPU (8 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 7 streamed, 2 kept on the CPU (8 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 6 streamed, 3 kept on the CPU (15 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.2 MiB = 20 experts of 60.0 KiB (fmt 4 gs 32, down fmt 4 gs 32), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.1 MiB = 20 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.1 MiB = 16 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 1 streamed, 1 kept on the CPU (5 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 1 streamed, 1 kept on the CPU (3 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 8 resident, 2 streamed, 0 kept on the CPU (0 rows)
+scratch budget: 61 of 4096 rows, 507904 additional bytes (limit 524288)
+formats:
+  int8 per row                       device 264 of 306 assignments, worst relative error 3.02e-07
+  int8 gs32                          device 270 of 306 assignments, worst relative error 2.92e-07
+  unpacked int4 per row              device 269 of 306 assignments, worst relative error 4.44e-07
+  unpacked int4 gs64, int8 down      device 273 of 306 assignments, worst relative error 3.50e-07
+  signed int4 pairs per row          device 259 of 306 assignments, worst relative error 3.00e-07
+  signed int4 pairs gs32             device 259 of 306 assignments, worst relative error 3.11e-07
+  int4 v+8 per row                   device 266 of 306 assignments, worst relative error 3.11e-07
+  int4 v+8 gs64, SwiGLU limit        device 265 of 306 assignments, worst relative error 2.87e-07
+  planar int4-g64                    device 271 of 306 assignments, worst relative error 3.06e-07
+  int3-g64                           device 261 of 306 assignments, worst relative error 2.72e-07
+  MXFP4 f32 scales                   device 263 of 306 assignments, worst relative error 2.86e-07
+  MXFP4 ue8m0, SiTU-GLU              device 268 of 306 assignments, worst relative error 1.18e-06
+  fp8 gs32                           device 264 of 306 assignments, worst relative error 3.13e-07
+  fp8 128x128 blocks                 device 267 of 306 assignments, worst relative error 3.19e-07
+  bf16                               device 268 of 306 assignments, worst relative error 3.12e-07
+  f32                                device 263 of 306 assignments, worst relative error 3.26e-07
+grouped:
+  int8 per row                   single device 576 of 768,   6 grouped GEMM /   0 GEMV batches, 0 summed on the device, worst 8.69e-04
+  int8 per row                   whole  device 1244 of 1248,   9 grouped GEMM /  15 GEMV batches, 7 summed on the device, worst 7.56e-04
+  int8 per row                   mixed  device 1203 of 1248,   0 grouped GEMM /  66 GEMV batches, 2 summed on the device, worst 2.80e-07
+  int8 per row                   decode device  42 of  42,   0 grouped GEMM /   8 GEMV batches, 0 summed on the device, worst 2.16e-07
+  int4 per row                   single device 576 of 768,   6 grouped GEMM /   0 GEMV batches, 0 summed on the device, worst 1.22e-03
+  int4 per row                   whole  device 1230 of 1248,   9 grouped GEMM /  14 GEMV batches, 5 summed on the device, worst 1.30e-03
+  int4 per row                   mixed  device 1200 of 1248,   2 grouped GEMM /  62 GEMV batches, 3 summed on the device, worst 1.21e-03
+  int4 per row                   decode device  42 of  42,   0 grouped GEMM /   8 GEMV batches, 0 summed on the device, worst 2.75e-07
+  int4 v+8 gs64, SwiGLU limit    single device 576 of 768,   6 grouped GEMM /   0 GEMV batches, 0 summed on the device, worst 9.37e-04
+  int4 v+8 gs64, SwiGLU limit    whole  device 1248 of 1248,  10 grouped GEMM /  13 GEMV batches, 8 summed on the device, worst 9.60e-04
+  int4 v+8 gs64, SwiGLU limit    mixed  device 1208 of 1248,   1 grouped GEMM /  66 GEMV batches, 4 summed on the device, worst 8.71e-04
+  int4 v+8 gs64, SwiGLU limit    decode device  42 of  42,   0 grouped GEMM /   8 GEMV batches, 0 summed on the device, worst 2.19e-07
+  signed int4 pairs gs32         single device 576 of 768,   6 grouped GEMM /   0 GEMV batches, 0 summed on the device, worst 8.96e-04
+  signed int4 pairs gs32         whole  device 1235 of 1248,  10 grouped GEMM /  12 GEMV batches, 5 summed on the device, worst 9.10e-04
+  signed int4 pairs gs32         mixed  device 1200 of 1248,   4 grouped GEMM /  61 GEMV batches, 4 summed on the device, worst 9.85e-04
+  signed int4 pairs gs32         decode device  42 of  42,   0 grouped GEMM /   8 GEMV batches, 0 summed on the device, worst 2.10e-07
+  planar int4-g64                single device 576 of 768,   6 grouped GEMM /   0 GEMV batches, 0 summed on the device, worst 9.11e-04
+  planar int4-g64                whole  device 1240 of 1248,   8 grouped GEMM /  16 GEMV batches, 6 summed on the device, worst[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 243.0 KiB = 2 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 0 promotions per token, uploads awaited (COLI_VK_TIER_SYNC), streaming cold experts of prompt steps through 2 slots
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 7 streamed, 2 kept on the CPU (8 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 6 streamed, 3 kept on the CPU (14 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 7 streamed, 2 kept on the CPU (8 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 8 streamed, 1 kept on the CPU (5 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 6 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 1 resident, 9 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.1 MiB = 20 experts of 54.0 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 303.8 KiB = 7 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 303.8 KiB = 7 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 303.8 KiB = 7 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 526.5 KiB = 6 experts of 81.0 KiB (fmt 12 gs 32, down fmt 12 gs 32), device memory, own queue, up to 4 promotions per token
+[VK] tier test test: device 6765 of 12000 routed experts (56.4%; this test 6765 of 12000) | CPU RAM hits 0, disk loads 0 | resident 6 (budget 6, 486.0 KiB of 526.5 KiB, 1 blocks, frag 0.13) | uploads 14 (1008.0 KiB, 0 warm), evictions 8, skipped 0 queue + 0 rate, failed 0 | device 28.4 ms, CPU share 84.6 ms, waited 6.2 ms (78% of device time hidden) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.5 MiB = 20 experts of 73.8 KiB (fmt 1, down fmt 1), device memory, own queue, up to 64 promotions per token
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 184.4 KiB = 2 experts of 73.8 KiB (fmt 1, down fmt 1), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)
+[VK] tier test test: device 82 of 156 routed experts (52.6%; this test 82 of 156) | CPU RAM hits 0, disk loads 0 | resident 2 (budget 2, 147.5 KiB of 184.4 KiB, 1 blocks, frag 0.00) | uploads 3 (216.0 KiB, 0 warm), evictions 1, skipped 0 queue + 0 rate, failed 0 | device 1.9 ms, CPU share 2.1 ms, waited 2.3 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 830.2 KiB = 10 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 64 promotions per token, uploads awaited (COLI_VK_TIER_SYNC); the extra layers' experts (1, fmt 10): 1 of 288.8 KiB in a pool of 324.0 KiB
+[VK] tier test test: device 1956 of 3360 routed experts (58.2%; this test 1956 of 3360) | CPU RAM hits 0, disk loads 0 | resident 10 (budget 10, 405.0 KiB of 830.2 KiB, 1 blocks, frag 0.00) | uploads 12 (936.0 KiB, 0 warm), evictions 1, skipped 0 queue + 0 rate, failed 0 | device 7.1 ms, CPU share 20.8 ms, waited 11.1 ms (0% of device time hidden) | extra layers (1): 307 of 1680 routed experts on the device, resident 1 (budget 1) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 506.2 KiB = 4 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 1 promotions per token, uploads awaited (COLI_VK_TIER_SYNC); the extra layers' experts (1, fmt 10): 1 of 288.8 KiB in a pool of 324.0 KiB
+[VK] tier test test: device 984 of 1920 routed experts (51.2%; this test 984 of 1920) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 162.0 KiB of 506.2 KiB, 1 blocks, frag 0.00) | uploads 7 (756.0 KiB, 0 warm), evictions 2, skipped 0 queue + 2 rate, failed 0 | device 4.6 ms, CPU share 25.3 ms, waited 0.4 ms (90% of device time hidden) | extra layers (1): 209 of 720 routed experts on the device, resident 1 (budget 1) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test: the extra layers' expert format 0/0 (gs 0/0) has no device form, their experts stay on the CPU
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 506.2 KiB = 10 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 1 promotions per token
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 922.5 KiB = 20 experts of 45.0 KiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 64 promotions per token
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 506.2 KiB = 8 experts of 40.5 KiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 0 promotions per token, streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 7 streamed, 1 kept on the CPU (1 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test test: device 1120 of 1128 routed experts (99.3%; this test 1120 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 324.0 KiB of 506.2 KiB, 1 blocks, frag 0.00) | uploads 4 (144.0 KiB, 4 warm), evictions 0, skipped 0 queue + 8 rate, failed 0 | device 1.9 ms, CPU share 0.2 ms, waited 1.5 ms (25% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (2.5 MiB, 0.49 GB/s) and 516 rows streamed in 48 sub-batches, prefetched 16 (16 used), 1 cold experts (1 rows) kept on the CPU
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 891.0 KiB = 8 experts of 54.0 KiB (fmt 4 gs 64, down fmt 13 gs 32), device memory, own queue, up to 0 promotions per token, streaming cold experts of prompt steps through 8 slots
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 7 streamed, 1 kept on the CPU (2 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 7 streamed, 1 kept on the CPU (2 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 7 streamed, 1 kept on the CPU (2 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 7 streamed, 1 kept on the CPU (2 rows)
+[VK] tier test test: device 1111 of 1128 routed experts (98.5%; this test 1111 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 648.0 KiB of 891.0 KiB, 1 blocks, frag 0.00) | uploads 4 (192.0 KiB, 4 warm), evictions 0, skipped 0 queue + 17 rate, failed 0 | device 2.0 ms, CPU share 0.4 ms, waited 1.2 ms (37% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 60 cold experts (3.3 MiB, 0.66 GB/s) and 510 rows streamed in 36 sub-batches, prefetched 32 (30 used), 4 cold experts (8 rows) kept on the CPU
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 934.4 KiB = 8 experts of 74.8 KiB (fmt 12 gs 128, down fmt 12 gs 128), device memory, own queue, up to 0 promotions per token, streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 7 streamed, 1 kept on the CPU (2 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test test: device 1116 of 1128 routed experts (98.9%; this test 1116 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 598.0 KiB of 934.4 KiB, 1 blocks, frag 0.00) | uploads 4 (288.0 KiB, 4 warm), evictions 0, skipped 0 queue + 12 rate, failed 0 | device 2.6 ms, CPU share 0.3 ms, waited 1.5 ms (42% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (4.6 MiB, 0.78 GB/s) and 501 rows streamed in 51 sub-batches, prefetched 16 (16 used), 1 cold experts (2 rows) kept on the CPU
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 742.5 KiB = 8 experts of 45.0 KiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 0 promotions per token, streaming cold experts of prompt steps through 8 slots
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 7 streamed, 1 kept on the CPU (1 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test test: device 1120 of 1128 routed experts (99.3%; this test 1120 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 540.0 KiB of 742.5 KiB, 1 blocks, frag 0.00) | uploads 4 (144.0 KiB, 4 warm), evictions 0, skipped 0 queue + 8 rate, failed 0 | device 2.6 ms, CPU share 0.3 ms, waited 1.8 ms (31% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (2.8 MiB, 0.52 GB/s) and 516 rows streamed in 35 sub-batches, prefetched 31 (31 used), 1 cold experts (1 rows) kept on the CPU
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 1.8 MiB = 8 experts of 144.8 KiB (fmt 11, down fmt 11), device memory, own queue, up to 0 promotions per token, streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 7 streamed, 1 kept on the CPU (2 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test test: device 1116 of 1128 routed experts (98.9%; this test 1116 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 1.1 MiB of 1.8 MiB, 1 blocks, frag 0.00) | uploads 4 (576.0 KiB, 4 warm), evictions 0, skipped 0 queue + 12 rate, failed 0 | device 2.0 ms, CPU share 0.3 ms, waited 1.5 ms (23% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (8.9 MiB, 1.36 GB/s) and 503 rows streamed in 48 sub-batches, prefetched 16 (16 used), 1 cold experts (2 rows) kept on the CPU
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 742.5 KiB = 8 experts of 45.0 KiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 0 promotions per token, streaming cold experts of prompt steps through 8 slots
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 48 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 33 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 64 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 2 resident, 7 streamed, 1 kept on the CPU (2 rows)
+[VK] tier test stream: a step of 40 rows; cold experts with 3 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 1: 2 resident, 8 streamed, 0 kept on the CPU (0 rows)
+[VK] tier test test: device 1118 of 1128 routed experts (99.1%; this test 1118 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 540.0 KiB of 742.5 KiB, 1 blocks, frag 0.00) | uploads 4 (144.0 KiB, 4 warm), evictions 0, skipped 0 queue + 10 rate, failed 0 | device 2.9 ms, CPU share 0.3 ms, waited 1.9 ms (35% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (2.8 MiB, 0.53 GB/s) and 514 rows streamed in 37 sub-batches, prefetched 32 (31 used), 1 cold experts (2 rows) kept on the CPU
+[VK] memory at exit: weights 0.0 MiB, expert tier 5.9 MiB (peaks), KV mirror 0.0 MiB in device-local memory type 0 (not host-visible); the dense chain's state in type 0 (device-local); 96.3 MiB staged in 8892 copies (1280 submits), 96.3 MiB of them straight from host memory in 8892 copies (0 not imported), 53 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] reusable host imports: created 12, reused 4593, fallback 45, peak 0.63 MiB (cap 64 MiB)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 32624 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] ready: AMD Radeon Graphics (RADV GFX1201), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] tier test: on, AMD Radeon Graphics (RADV GFX1201), budget 934.4 KiB = 8 experts of 74.8 KiB (fmt 12 gs 128, down fmt 12 gs 128), device memory, own queue, up to 0 promotions per token, streaming cold experts of prompt steps through 4 slots
+[VK] tier test stream: a step of 32 rows; cold experts with 1 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 0 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] COLI_VK_STAGED_FAULT: commit #1 fails
+[VK] staged upload failed (commit: -2): the tensors are not resident
+[VK] tier test stream: a step of 32 rows; cold experts with 1 rows or more go to the device (COLI_VK_TIER_STREAM_ROWS); layer 0: 0 resident, 2 streamed, 0 kept on the CPU (0 rows)
+[VK] memory at exit: weights 0.0 MiB, expert tier 0.3 MiB (peaks), KV mirror 0.0 MiB in device-local memory type 0 (not host-visible); the dense chain's state in type 0 (device-local); 96.5 MiB staged in 8906 copies (1282 submits), 96.5 MiB of them straight from host memory in 8906 copies (0 not imported), 54 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] reusable host imports: created 24, reused 4605, fallback 45, peak 0.63 MiB (cap 64 MiB)
+ 9.40e-04
+  planar int4-g64                mixed  device 1213 of 1248,   2 grouped GEMM /  66 GEMV batches, 4 summed on the device, worst 8.76e-04
+  planar int4-g64                decode device  42 of  42,   0 grouped GEMM /   8 GEMV batches, 0 summed on the device, worst 2.55e-07
+  grouped route taken, device sums taken
+warm:
+  warm start: 7 experts planned in heat order and resident, the hottest served by the device
+  warm-fill: opt-in populated seven slots; default preserved historical-only behavior
+adapt:
+  adapt: phase A device 73%, resident A 6; phase B device 33% then 72%, resident B 6, A 0, all 6 (budget 6)
+partial:
+  partial: a step of 24 assignments, the device took 5 (max_rows 5), relative error 2.06e-07
+sync:
+  sync: phase A resident 2 of 2; phase B device 60 of 120, resident 0 1, 1 0, 5 1, all 2 (budget 2), evictions 1, failed 0
+extra:
+  extra: an f32 expert is 8 int4 ones; device main 1649 of 1680, extra 307 of 1680; resident main 10, extra 1 (its pool 294960 of 331776 bytes), evictions 1, failed 0, worst relative error 2.78e-07
+  extra, full tier: main resident 4 after the first phase; then main 4 + extra 1, extra device 209 of 720, evictions 2, failed 0, worst 2.86e-07
+DeepSeek V4:
+  MXFP4 ue8m0, DeepSeek V4 roundings device 264 of 306 assignments, 264 rows bit-identical to the CPU's arithmetic, worst row 0.00e+00, worst sum 0.00e+00
+stream:
+  planar int4-g64                    device 1120 of 1128 assignments (516 streamed), 8 on the CPU, 63 loads (0 batches), 4 warm, worst 2.76e-07
+  unpacked int4 gs64, int8 down      device 1111 of 1128 assignments (510 streamed), 17 on the CPU, 62 loads (30 batches), 4 warm, worst 3.25e-07
+  fp8 128x128 blocks                 device 1116 of 1128 assignments (501 streamed), 12 on the CPU, 63 loads (0 batches), 4 warm, worst 3.31e-07
+  MXFP4 ue8m0, SiTU-GLU              device 1120 of 1128 assignments (516 streamed), 8 on the CPU, 63 loads (29 batches), 4 warm, worst 1.32e-06
+  bf16                               device 1116 of 1128 assignments (503 streamed), 12 on the CPU, 63 loads (0 batches), 4 warm, worst 3.39e-07
+  MXFP4, DeepSeek V4 roundings       device 1118 of 1128 assignments (514 streamed), 10 on the CPU, 64 loads (30 batches), 4 warm, worst 0.00e+00
+stream fault: whole group replayed on CPU, staging slots refilled correctly
+PASS

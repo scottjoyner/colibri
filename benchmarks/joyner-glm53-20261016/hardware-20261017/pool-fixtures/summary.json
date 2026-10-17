@@ -1,0 +1,120 @@
+{
+  "schema": 1,
+  "date_utc": "2026-10-17T07:19:09.032438+00:00",
+  "machine": "joyner",
+  "driver": "RADV GFX1201 PCI 1002:7551",
+  "target": "small Vulkan tier fixture, not full GLM",
+  "binary_sha256": "62cafdc02325c0c169c3c2984ac91be9213cc581868e989152fff37736830603",
+  "memory_limit_bytes": 1073741824,
+  "unit_swap_bytes": 0,
+  "production_unchanged": true,
+  "trial_order": [
+    0,
+    1,
+    1,
+    0,
+    1,
+    0,
+    0,
+    1
+  ],
+  "trials": [
+    {
+      "trial": 0,
+      "pool_enabled": false,
+      "wall_seconds": 2.644,
+      "created_last": 0,
+      "reused_last": 0,
+      "fallback_last": 0,
+      "peak_MiB": 0,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "fe9f63b4d3b3fdd8c6a483f63d5db0aeba952e9a34a91f0c9933e75e33e735c5"
+    },
+    {
+      "trial": 1,
+      "pool_enabled": true,
+      "wall_seconds": 2.54,
+      "created_last": 24,
+      "reused_last": 4605,
+      "fallback_last": 45,
+      "peak_MiB": 0.63,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "d8f9e7fde30b95776035d75f495ca0ca5a1100ca47346da9467b8b993d9c9a7d"
+    },
+    {
+      "trial": 2,
+      "pool_enabled": true,
+      "wall_seconds": 2.543,
+      "created_last": 24,
+      "reused_last": 4605,
+      "fallback_last": 45,
+      "peak_MiB": 0.63,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "1fa30ceb7cb062c8299222b13ca48998aa2183970fb1d49c85ebf27ef6a4c008"
+    },
+    {
+      "trial": 3,
+      "pool_enabled": false,
+      "wall_seconds": 2.645,
+      "created_last": 0,
+      "reused_last": 0,
+      "fallback_last": 0,
+      "peak_MiB": 0,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "af9ac49ecf045c3af13d62309610becad059c39849332d70052ca5efe2c0ec72"
+    },
+    {
+      "trial": 4,
+      "pool_enabled": true,
+      "wall_seconds": 2.526,
+      "created_last": 24,
+      "reused_last": 4605,
+      "fallback_last": 45,
+      "peak_MiB": 0.63,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "13ee1564a5ede633da3979f28b1d4fc5a2f2a089547021212cfb223929bb0c39"
+    },
+    {
+      "trial": 5,
+      "pool_enabled": false,
+      "wall_seconds": 2.689,
+      "created_last": 0,
+      "reused_last": 0,
+      "fallback_last": 0,
+      "peak_MiB": 0,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "6990790d707dd31b836e93340fb1422a477c2048a4066ea1aec9928aae7b0cb4"
+    },
+    {
+      "trial": 6,
+      "pool_enabled": false,
+      "wall_seconds": 2.629,
+      "created_last": 0,
+      "reused_last": 0,
+      "fallback_last": 0,
+      "peak_MiB": 0,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "cb320c8882bf58c4334a59cb2f8f539d145aab45857e3cfd46c9085208c74565"
+    },
+    {
+      "trial": 7,
+      "pool_enabled": true,
+      "wall_seconds": 2.529,
+      "created_last": 24,
+      "reused_last": 4605,
+      "fallback_last": 45,
+      "peak_MiB": 0.63,
+      "memory_full_psi_avg10_before": 0.0,
+      "log_sha256": "4160f79887acf8426e6afdb35318d2e537018f441ae301fe11ef262c665c097f"
+    }
+  ],
+  "median_baseline_seconds": 2.644,
+  "median_pool_seconds": 2.534,
+  "median_pool_wall_change_percent": -4.16,
+  "source_pinned": "scottjoyner/colibri experiment/joyner-vulkan-import-reuse-pool-20261017",
+  "notes": [
+    "test fixture covers small expert transfers, not GLM checkpoint",
+    "host import pool hard max 64MiB and 12 slots; primary device only",
+    "normal backend imports may differ in size, concurrency and memory pressure"
+  ]
+}

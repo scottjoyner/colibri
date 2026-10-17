@@ -1,0 +1,27 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 32624 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] ready: AMD Radeon Graphics (RADV GFX1201), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] glm53: device ready, dense matrices on the device (default)
+Vulkan: active for resident matrices
+[VK] glm53: dense chain on (COLI_VK_CHAIN=1)
+[VK] glm53 chain fit: free 34148118527 B, reserve 1073741824 B, fixed 653413120 B (the engine's 166873856 B, the pools' 486539264 B), tail 356843520 B, layers 170542552 170542552 170542552 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 99763672 99763672 88428760 99763672 B, matrices 165494792 165494792 165494792 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 94715912 94715912 87564296 94715912 B
+[VK] glm53 chain: 45 of 45 layers on the device (4.26 GiB), 0 on the CPU (free 31.80 GiB, reserve 1.00 GiB)
+[VK] glm53: dense weights on the device and in host RAM (COLI_VK_DENSE_HOST=1)
+[VK] glm53 chain: 45 layers on the device (34 KDA, 11 MLA with the k-pooled indexer, 3 dense), 4 streams, 15.4 MiB of parameters
+[VK] glm53 chain: 45 of 45 layers placed: 4395884904 B of matrices on the device (the fit counted 4395884904 B for these layers), chain buffers 188870904 B, device memory held 4764729344 B
+experts: 14.2 MB slots, 1 per layer across 42 sparse layers (0.6 GB resident)
+[VK] tier glm53: on, AMD Radeon Graphics (RADV GFX1201), budget 2.00 GiB = 80 experts of 13.5 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.00 GB at 12 positions)
+[VK] glm53 chain: prompt chunks of up to 256 rows (1689 KiB a row; 1.13 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+load 29.8s, prefill 3 tokens in 6.8s
+prefill profile: attention 0.2s, ffn 4.5s (disk 3.3s), head 2.0s
