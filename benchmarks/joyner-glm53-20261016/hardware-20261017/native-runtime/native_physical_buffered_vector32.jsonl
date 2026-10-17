@@ -1,0 +1,7 @@
+{"mode":"six","experts":37,"read_calls":222,"p50_ms":0.587,"p95_ms":3.530,"p99_ms":15.514,"all_six_tensor_hashes_match":true}
+{"mode":"grouped","experts":37,"read_calls":42,"p50_ms":0.578,"p95_ms":0.787,"p99_ms":0.951,"all_six_tensor_hashes_match":true}
+{"mode":"vector","experts":37,"read_calls":42,"p50_ms":0.588,"p95_ms":0.883,"p99_ms":1.038,"all_six_tensor_hashes_match":true}
+{"mode":"vector","experts":37,"read_calls":42,"p50_ms":0.608,"p95_ms":0.781,"p99_ms":0.871,"all_six_tensor_hashes_match":true}
+{"mode":"grouped","experts":37,"read_calls":42,"p50_ms":0.571,"p95_ms":0.767,"p99_ms":0.890,"all_six_tensor_hashes_match":true}
+{"mode":"six","experts":37,"read_calls":222,"p50_ms":0.592,"p95_ms":0.721,"p99_ms":0.751,"all_six_tensor_hashes_match":true}
+PASS native buffered read 4-pass exact tensor checks
