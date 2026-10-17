@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "utc": "2026-10-17T14:58:28Z",
+  "source_pin": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "physical_model_shards": 62,
+  "full_expert_tensors_indexed": 12384,
+  "tensor_sizes_bytes": {
+    "down_proj.weight": 4194304,
+    "down_proj.weight.qs": 524288,
+    "gate_proj.weight": 4194304,
+    "gate_proj.weight.qs": 524288,
+    "up_proj.weight": 4194304,
+    "up_proj.weight.qs": 524288
+  },
+  "full_expert_logical_bytes": 14155776,
+  "train_runs": [
+    "glm53_native_expert_trace_20261016_run01.jsonl",
+    "glm53_native_expert_trace_20261016_run02.jsonl",
+    "glm53_native_expert_trace_20261016_run03.jsonl",
+    "glm53_native_expert_trace_20261016_run04.jsonl"
+  ],
+  "validation_run": "glm53_native_expert_trace_20261016_run05.jsonl",
+  "validation_run_sha256": "aab4f8bc9207d2cc614c5dbffe5cdcc9b3907a807413ebf9e6d2922a2b14f803",
+  "evaluation_run": "glm53_native_expert_trace_20261016_run06_v2.jsonl",
+  "evaluation_run_sha256": "ff6fafb5a515eee6bbe29a2946e039829400c0f8932eb8f86092c333daa9a42b",
+  "events": 32,
+  "policy_order": [
+    "baseline",
+    "validation_gated"
+  ],
+  "candidate_second_threshold": 0.4,
+  "source_validated": true,
+  "max_concurrent_full_expert_reads": 2,
+  "max_parallel_expert_memory_reserved": 28311552,
+  "physical_reads_enabled": true,
+  "results": [
+    {
+      "mode": "baseline",
+      "candidates": 64,
+      "precision": 0.6875,
+      "selected_recall": 0.17188,
+      "cold_coverage": 0.17188,
+      "physical": {
+        "full_experts_read": 64,
+        "physical_O_DIRECT_GB": 0.9075,
+        "buffered_EOF_tail_bytes": 0,
+        "buffered_EOF_tail_reads": 0,
+        "physical_sector_delta_GB": 0.9075,
+        "expert_read_ms_p50": 9.323,
+        "expert_read_ms_p95": 10.771,
+        "expert_read_ms_p99": 17.919,
+        "tensor_read_ms_p99": 2.572,
+        "two_expert_step_ms_p50": 9.485,
+        "two_expert_step_ms_p99": 18.107
+      }
+    },
+    {
+      "mode": "validation_gated",
+      "candidates": 37,
+      "precision": 0.75676,
+      "selected_recall": 0.10938,
+      "cold_coverage": 0.10938,
+      "physical": {
+        "full_experts_read": 37,
+        "physical_O_DIRECT_GB": 0.5247,
+        "buffered_EOF_tail_bytes": 0,
+        "buffered_EOF_tail_reads": 0,
+        "physical_sector_delta_GB": 0.5247,
+        "expert_read_ms_p50": 8.66,
+        "expert_read_ms_p95": 10.304,
+        "expert_read_ms_p99": 10.509,
+        "tensor_read_ms_p99": 2.527,
+        "two_expert_step_ms_p50": 8.555,
+        "two_expert_step_ms_p99": 10.692
+      }
+    }
+  ],
+  "limitations": [
+    "Six tensor full expert O_DIRECT reads are not uploaded to Vulkan",
+    "No native attention layer timestamp, no inference overlap, no tokens/sec gain",
+    "Synthetic-token GLM heldout may not generalize; no native logits parity",
+    "Physical block-device sector counts include concurrent traffic",
+    "Consumer performance is NVMe-only and cannot prove viable 20ms deadline",
+    "Some file-ending tensors require a bounded <4KiB read-only buffered EOF tail"
+  ]
+}
