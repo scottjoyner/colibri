@@ -161,8 +161,8 @@ def readiness(model:Path,root:Path,*,host_reserve_gib:float=4,
     # fitting together, nor proof of a safe full model launch.
     reasons.extend([
        "NO-GO: expected upstream commit is not verified by a complete source SHA manifest",
-       "NO-GO: no bounded full-GLM startup / cgroup RSS and PSI acceptance receipt",
-       "NO-GO: no exact full-model logits, generated tokens/s and p99 layer deadline receipt",
+       "NO-GO: prior bounded 8-token synthetic full-GLM run (0.630 tok/s) does not establish sustained natural-language production readiness",
+       "NO-GO: no full-model reference logit parity, sustained natural-dialogue tok/s or p99 layer deadline acceptance",
        "NO-GO: no authenticated fleet admission, fencing or rollback verification",
     ])
     return {
@@ -174,7 +174,8 @@ def readiness(model:Path,root:Path,*,host_reserve_gib:float=4,
       "gpu":gpu,"budget_request_gib":{
         "host_reserve":host_reserve_gib,"gpu_reserve":gpu_reserve_gib,
         "expert_cache":expert_cache_gib,"gpu_tier":gpu_tier_gib,"staging":staging_gib},
-      "production_model_loaded":False,"fleet_admitted":False,
+      "production_model_loaded":None,"fleet_admitted":None,
+      "inference_started_by_preflight":False,"fleet_admission_modified":False,
       "writes_to_model":False,"starts_server":False,"decision":"HOLD",
       "blockers":reasons}
 

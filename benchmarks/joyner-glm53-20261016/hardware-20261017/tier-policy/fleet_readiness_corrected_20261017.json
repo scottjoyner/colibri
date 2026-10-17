@@ -1,0 +1,74 @@
+{
+  "blockers": [
+    "host swap already in use; reject new high-memory placement",
+    "NO-GO: expected upstream commit is not verified by a complete source SHA manifest",
+    "NO-GO: prior bounded 8-token synthetic full-GLM run (0.630 tok/s) does not establish sustained natural-language production readiness",
+    "NO-GO: no full-model reference logit parity, sustained natural-dialogue tok/s or p99 layer deadline acceptance",
+    "NO-GO: no authenticated fleet admission, fencing or rollback verification"
+  ],
+  "budget_request_gib": {
+    "expert_cache": 0.1,
+    "gpu_reserve": 4,
+    "gpu_tier": 2,
+    "host_reserve": 4,
+    "staging": 0.5
+  },
+  "checkpoint": {
+    "categories": {
+      "dense_or_other": {
+        "bytes": 17015135608,
+        "tensors": 1270
+      },
+      "output": {
+        "bytes": 1268776960,
+        "tensors": 1
+      },
+      "routed_experts": {
+        "bytes": 175305129984,
+        "tensors": 74304
+      },
+      "vision": {
+        "bytes": 1127927808,
+        "tensors": 347
+      }
+    },
+    "expected_source_pin": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+    "header_sha256": "a4d728e48359108beca382eb34a0656804f4fb19df007ee5589c1cd1000e1231",
+    "shards": 62,
+    "source": "local_headers_only",
+    "source_pin_cryptographically_verified": false,
+    "total_shard_file_bytes": 194727394184
+  },
+  "decision": "HOLD",
+  "fleet_admission_modified": false,
+  "fleet_admitted": null,
+  "gpu": {
+    "candidates": 1,
+    "device_count": 2,
+    "reason": null,
+    "selected": {
+      "available_bytes": 34148831232,
+      "device": "0x7551",
+      "name": "card1",
+      "total_bytes": 34208743424,
+      "used_bytes": 59912192,
+      "vendor": "0x1002"
+    }
+  },
+  "host": "joyner",
+  "inference_started_by_preflight": false,
+  "memory": {
+    "available_bytes": 6325157888,
+    "pressure_avg10": {
+      "full": 0.0,
+      "some": 0.0
+    },
+    "swap_used_bytes": 1096802304,
+    "total_bytes": 15841255424
+  },
+  "mode": "read_only_fleet_runtime_preflight",
+  "production_model_loaded": null,
+  "schema": 1,
+  "starts_server": false,
+  "writes_to_model": false
+}
