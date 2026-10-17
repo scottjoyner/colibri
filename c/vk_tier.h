@@ -216,6 +216,7 @@ int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
 void vkt_shutdown(void);
 int  vkt_plan(int *layers, int *eids, int max);
+void vkt_warm_report(const char *engine, int n, double seconds);
 int  vkt_put(int layer, int eid, const VktExpertSrc *src);   /* any thread */
 void vkt_put_done(void);
 void vkt_note(int layer, int eid, const VktExpertSrc *src);
@@ -269,6 +270,7 @@ static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(voi
 static inline int  vkt_ready(void){return 0;}
 static inline void vkt_shutdown(void){}
 static inline int  vkt_plan(int *l,int *e,int m){(void)l;(void)e;(void)m;return 0;}
+static inline void vkt_warm_report(const char *e,int n,double s){(void)e;(void)n;(void)s;}
 static inline int  vkt_put(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;return 0;}
 static inline void vkt_put_done(void){}
 static inline void vkt_note(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;}

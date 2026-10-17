@@ -4683,7 +4683,7 @@ static void glm53_vk_tier_start(GModel *m) {
                 }
                 vkt_put_done();
                 m->hits = hits; m->miss = miss; m->ebytes = eb;
-                fprintf(stderr, "[VK] tier glm53: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+                vkt_warm_report("glm53", n, now_s() - t0);
             }
             free(pl); free(pe);
         }

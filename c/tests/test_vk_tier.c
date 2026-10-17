@@ -302,6 +302,44 @@ static void warm(void) {
     vkt_shutdown(); model_free();
 }
 
+/* Upstream cfab4f65: startup fill requires explicit opt-in in this fork. */
+static void warm_fill_optin(void) {
+    VktFmt f={VKT_SRC_I4U_PAIRS_GS,64};
+    uint32_t hist[L][E], *rows[L];
+    for(int l=0;l<L;l++) {
+        rows[l]=hist[l];
+        for(int e=0;e<E;e++)hist[l][e]=0;
+    }
+    hist[0][E-1]=1000;
+    for(int mode=0;mode<2;mode++) {
+        model_make(f,f);g_act=VKT_ACT_SWIGLU;g_limit=0;
+        set_budget(7,f,f);
+        VktConfig vc=cfg_of(f,f,VKT_ACT_SWIGLU,0);
+        if(mode)setenv("COLI_VK_TIER_FILL","1",1);
+        else unsetenv("COLI_VK_TIER_FILL");
+        CHECK(vkt_init(&vc,rows),"warm-fill: init mode %d failed",mode);
+        int pl[L*E],pe[L*E],n=vkt_plan(pl,pe,L*E);
+        CHECK(n==(mode?7:1),"warm-fill: mode %d got %d",mode,n);
+        CHECK(n>0 && pl[0]==0 && pe[0]==E-1,"warm-fill: history priority changed");
+        for(int i=0;i<n;i++) {
+            int dupe=0;
+            for(int j=0;j<i;j++)dupe+=(pl[i]==pl[j]&&pe[i]==pe[j]);
+            CHECK(!dupe,"warm-fill: duplicate expert %d",i);
+        }
+        for(int i=0;i<n;i++) {
+            VktExpertSrc src=src_of(&ex[pl[i]][pe[i]]);
+            vkt_put(pl[i],pe[i],&src);
+        }
+        vkt_put_done();
+        int live=0;
+        for(int i=0;i<n;i++)live+=vkt_resident(pl[i],pe[i]);
+        CHECK(live==n,"warm-fill: mode %d only %d of %d resident",mode,live,n);
+        vkt_shutdown();model_free();
+    }
+    unsetenv("COLI_VK_TIER_FILL");
+    puts("  warm-fill: opt-in populated seven slots; default preserved historical-only behavior");
+}
+
 /* a third of the experts fit; the hot set moves halfway */
 static void adapt(void) {
     VktFmt f = {VKT_SRC_FP8_GS, 32};
@@ -913,7 +951,7 @@ int main(int argc, char **argv) {
     scratch_budget();
     printf("formats:\n"); formats();
     printf("grouped:\n"); grouped();
-    printf("warm:\n"); warm();
+    printf("warm:\n"); warm(); warm_fill_optin();
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();
     printf("sync:\n"); sync_evict();
