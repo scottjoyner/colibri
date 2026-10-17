@@ -17,7 +17,7 @@ def read_trace(path: pathlib.Path):
     for line_no,line in enumerate(path.read_text().splitlines(),1):
         if not line.strip():continue
         e=json.loads(line)
-        if (e.get("v")!=1 or type(e.get("call")) is not int
+        if (e.get("v") not in (1,2) or type(e.get("call")) is not int
             or e["call"]<0 or e["call"]<last
             or e.get("n_experts")!=N_EXPERTS
             or e.get("topk")!=8 or e.get("layer",0) < 0
@@ -30,6 +30,21 @@ def read_trace(path: pathlib.Path):
             or not all(isinstance(x,(float,int)) and math.isfinite(x) for x in e["sketch"])
             or len(e.get("gates",[]))!=8 or not all(isinstance(g,(float,int)) and math.isfinite(g) for g in e["gates"])):
             raise ValueError(f"{path}:{line_no}: invalid or incompatible GLM53 expert trace")
+        if e["v"]==2:
+            mask_bytes=(N_EXPERTS+7)//8
+            try:
+                host=bytes.fromhex(e["host_mask"])
+                gpu=bytes.fromhex(e["gpu_mask"])
+            except (KeyError,TypeError,ValueError) as exc:
+                raise ValueError(f"{path}:{line_no}: missing/invalid full residency bitmap") from exc
+            if len(host)!=mask_bytes or len(gpu)!=mask_bytes:
+                raise ValueError(f"{path}:{line_no}: bitmap length mismatch")
+            for eid,tier in zip(e["ids"],e["resident"]):
+                in_ram=bool(host[eid>>3]&(1<<(eid&7)))
+                in_gpu=bool(gpu[eid>>3]&(1<<(eid&7)))
+                derived=2 if in_gpu else 1 if in_ram else 0
+                if derived!=tier:
+                    raise ValueError(f"{path}:{line_no}: selected expert residency contradicts bitmaps")
         last=e["call"];rows.append(e)
     if not rows:raise ValueError(f"{path}: empty or missing capture")
     return rows
@@ -67,7 +82,12 @@ def choose(policy,ev,prior,freq,cooc,n):
                 score.update(cooc[(l,src)])
         if not score:score.update(freq[l])
     else:raise ValueError(policy)
-    return [eid for eid,_ in sorted(score.items(),key=lambda kv:(-kv[1],kv[0]))[:n]]
+    # All policies must consume the SAME candidate budget. Previous-token has
+    # only 8 native IDs, so add layer-frequency fallbacks rather than allowing
+    # it to win the transfer-cost comparison by emitting fewer predictions.
+    ordered=[eid for eid,_ in sorted(score.items(),key=lambda kv:(-kv[1],kv[0]))]
+    fallback=[eid for eid,_ in sorted(freq[l].items(),key=lambda kv:(-kv[1],kv[0]))]
+    return list(dict.fromkeys(ordered+fallback+list(range(N_EXPERTS))))[:n]
 
 def replay(train_files,eval_files,budget):
     train=[read_trace(p) for p in train_files]
@@ -80,12 +100,16 @@ def replay(train_files,eval_files,budget):
     out=[]
     for policy in ("freq","prior-token","cross-layer"):
         matched=actual_misses=covered_misses=prefetch_bytes=wasted_bytes=0
-        nselected=nr=0
+        exact_unknown_bytes=exact_upload_bytes=exact_wasted_bytes=inventory_rows=0
+        nselected=nr=ncandidates=0
         for events in test:
             prior={}
             # Each event is evaluated BEFORE learning its native route.
             for ev in events:
                 preds=choose(policy,ev,prior,freq,cooc,budget)
+                if len(preds)!=budget or len(set(preds))!=budget:
+                    raise ValueError("cache policy failed equal-budget invariant")
+                ncandidates+=len(preds)
                 target=set(ev["ids"])
                 cold={eid for eid,res in zip(ev["ids"],ev["resident"]) if res==0}
                 resident={eid for eid,res in zip(ev["ids"],ev["resident"]) if res!=0}
@@ -97,24 +121,40 @@ def replay(train_files,eval_files,budget):
                 sent=set(preds)-resident
                 prefetch_bytes+=len(sent)*BYTES_PER_EXPERT
                 wasted_bytes+=len(sent-target)*BYTES_PER_EXPERT
+                if ev["v"]==2:
+                    host=bytes.fromhex(ev["host_mask"])
+                    gpu=bytes.fromhex(ev["gpu_mask"])
+                    def has(mask,eid):return bool(mask[eid>>3]&(1<<(eid&7)))
+                    # App-level tiers only. SSD page cache presence is UNKNOWN.
+                    unknown={e for e in preds if not has(host,e) and not has(gpu,e)}
+                    upload={e for e in preds if not has(gpu,e)}
+                    inventory_rows+=1
+                    exact_unknown_bytes+=len(unknown)*BYTES_PER_EXPERT
+                    exact_upload_bytes+=len(upload)*BYTES_PER_EXPERT
+                    exact_wasted_bytes+=len(unknown-target)*BYTES_PER_EXPERT
                 nselected+=len(target);nr+=1
                 prior[("call",ev["call"],ev["row"])]=ev
                 prior[("token",ev["layer"],ev["row"])]=ev
         out.append({"policy":policy,"budget_experts_per_step":budget,"rows":nr,
+            "candidate_slots":ncandidates,
+            "full_inventory_rows":inventory_rows,
+            "known_missing_host_and_gpu_gb":round(exact_unknown_bytes/1e9,4) if inventory_rows==nr else None,
+            "known_missing_gpu_gb":round(exact_upload_bytes/1e9,4) if inventory_rows==nr else None,
+            "known_missing_wasted_gb":round(exact_wasted_bytes/1e9,4) if inventory_rows==nr else None,
             "selected_recall":round(matched/nselected,5),
             "cold_coverage_upper_bound":round(covered_misses/actual_misses,5) if actual_misses else None,
             "estimated_prefetch_gb":round(prefetch_bytes/1e9,4),
             "estimated_wasted_gb":round(wasted_bytes/1e9,4)})
     return {"schema":1,"split":"independent_run_holdout","train_files":[p.name for p in train_files],
             "evaluation_files":[p.name for p in eval_files],
-            "note":"Counterfactual upper bound only: no SSD/GPU prefetch was issued. Missing memory-tier=0 may hit OS page cache.",
+            "note":"Counterfactual only; no speculative transfers issued. v2 traces contain full known RAM/GPU bitmaps but cannot tell whether Linux page cache contains an expert. Physical SSD bandwidth/speedup unmeasured.",
             "rows_evaluated":sum(len(ev) for ev in test),"policies":out}
 
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--train",nargs="+",type=pathlib.Path,required=True)
     ap.add_argument("--eval",nargs="+",type=pathlib.Path,required=True)
-    ap.add_argument("--budget",type=int,choices=[8,16,24,32],default=16)
+    ap.add_argument("--budget",type=int,choices=[1,2,4,8,16,24,32],default=16)
     ap.add_argument("--out",type=pathlib.Path)
     a=ap.parse_args()
     try: result=replay(a.train,a.eval,a.budget)

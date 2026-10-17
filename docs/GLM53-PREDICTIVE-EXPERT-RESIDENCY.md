@@ -41,3 +41,28 @@ The dataset's `call` field increases once per MoE invocation. Replay only connec
 Joyner's real GLM two-token smoke achieved only **0.604 tok/s** after 94.3s prefill, with 994 expert misses and ~14.1 GB loads. A 17-token natural prompt timed out at 230s. Optimizing prediction may not solve the synchronous prefill or RAM pressure alone: measure before attributing any acceleration to it.
 
 Rollback: do not set the trace env and the only hot-path cost is a never-open branch; the native model/router/cache remain functionally unchanged. No AssistX deployment or upstream changes.
+
+## October 16 held-out evidence: important negative finding
+
+Five independent, deliberately non-private synthetic-token-ID GLM inference runs completed with a bounded 6 GiB process RAM cap, zero swap and original production GPU services kept healthy. Run lengths: 420 + 798 + 798 + 798 + 798 native router records = **3612 rows / 28896 top-8 selections**. Runs 01-04 were training, run 05 held out. Private trace data and trained weight files remain in `/home/scott/.local/state/glm53-predictive-private-20261016` and MUST NOT be uploaded to this public repository.
+
+Simple held-out replay with *equal* candidate budgets per row:
+- **Recall@8**: layer-frequency 12.0%, previous-token 30.5%, cross-layer Markov 16.6%.
+- **Recall@16**: layer-frequency 20.1%, previous-token 37.5%, cross-layer Markov 26.9%.
+- **Recall@24**: 26.8%, 41.9%, 34.0% respectively.
+- **Recall@32**: 32.0%, 46.4%, 39.7% respectively.
+
+The small 4-step cross-layer attention head (37,824 parameters, eight CPU epochs) trained successfully on **2747 cross-layer pairs** but reached just **14.1% recall@16** on 779 held-out examples. A second attention variant augmented with *causal previous-token route memory* (37,920 parameters, sixteen CPU epochs) yielded **17.2% pure-head recall@16** and **36.0% hybrid recall@16**, versus a matched deterministic prior-token+frequency fallback at **37.6%**. **Both trained variants are NO-GO for runtime prefetch**, as neither beats the trivial baseline on this small, synthetic-prompt distribution.
+
+These results are inference-route prediction only. No speculative SSD reads, host copies, GPU uploads, or token verification occurred, and no speedup is claimed. The v1 candidate transfer-cost estimate assumed unknown selected-target residency for other predicted experts; it is **not a measured physical SSD byte count**. The v2 full inventory fixes that modeling blind spot in future run captures.
+
+Next: collect independent v2 full-inventory traces with distinct short natural prompts and varied synthetic prompts, validate training-vs-eval run splits and source revision, introduce a prefetch transfer-cost penalty into the attention objective, and compare measured *actual* SSD bytes/TTFT with the deterministic baseline before any device prefetch. Retain the stronger previous-token policy as a control.
+
+## Second full-inventory trace and frozen-model evaluation (October 17, 2026 EDT)
+
+- Run 06: **462 real-router events**, ABI v2 with 36-byte per-layer RAM and VRAM masks. Eight tokens generated at **0.618 tok/s**, bounded 6 GiB RAM and zero swap. 3,299 reported expert read requests totaling **46.70 GB**; 231/3,696 selections served by the GPU tier (6.2%). Production endpoints healthy throughout. Private SHA-256-pinned trace, not in Git.
+- Trained on runs 01–04 and previously validated on run 05. The *frozen* 37,920-param attention model was evaluated without retraining or tuning on run 06: on 459 cross-layer examples, **pure head recall@16 25.4%; hybrid 36.8%; matched native previous-token+frequency fallback 41.4%**. Negative result holds on the new run: no predictor-driven prefetch authorization.
+- Deterministic offline replay on all 462 ABI-v2 rows at equal budget=16: **cross-layer Markov 46.3%** selected-recall, previous-token 41.1%, frequency 33.1%. Nonetheless, the cross-layer model proposed about **100 GB** of candidate weights not known to be in host/GPU cache, with about **78 GB** not among actually selected experts. These are *candidate-weight accounting upper bounds*, not measured physical I/O or actual transfers; OS page-cache state remains unknown.
+- Critical regression caught by full fixture A/B: non-streaming model fixtures have no expert-cache array. A read-only trace hook must report empty application-level residency for this case, not dereference NULL. A C regression covers both cache-present and cache-absent branches; full fixture token/logit A/B is required before promotion.
+
+**Decision:** use previous-token routes and small top-N hypotheses as controls; add confidence/calibration and tier quota work only in offline or read-only shadow mode. Avoid training on generated repeated IDs as if it represented arbitrary real user text. A genuinely representative private prompt corpus and a tokenizer/sampling oracle must precede generalization claims.

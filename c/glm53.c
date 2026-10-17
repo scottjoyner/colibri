@@ -1835,7 +1835,28 @@ static void g53_expert_trace_route(GModel *m, int layer, int row,
     if (!g53_expert_trace_enabled()) return;
     if (g53_trace_rows >= G53_TRACE_MAX_ROWS) return; /* fixed storage bound */
     const Cfg *c = &m->c;
-    LCache *cache = &m->ecache[layer];
+    /* A non-streamed fixture has all experts in Mat arrays and no ecache:
+     * telemetry must not dereference a NULL streaming-only cache table. Its
+     * resident=0 status means unknown *expert-tier* state, not proof of SSD IO. */
+    LCache *cache = m->ecache ? &m->ecache[layer] : NULL;
+    /* Known residency for ALL experts, not only the selected eight. Without
+     * this the replay misprices prefetch candidates absent from the native route.
+     * Bit order: expert e -> byte e/8, bit e%8; fixed bounded stack allocation. */
+    if (c->n_experts < 1 || c->n_experts > 4096) {
+        fprintf(stderr, "GLM53_EXPERT_TRACE supports 1..4096 experts per layer\n");
+        exit(1);
+    }
+    unsigned char host_bits[512] = {0}, gpu_bits[512] = {0};
+    for (int j = 0; cache && j < cache->n; j++) {
+        int e = cache->s[j].eid;
+        if (e >= 0 && e < c->n_experts)
+            host_bits[e >> 3] |= (unsigned char)(1u << (e & 7));
+    }
+#ifdef COLI_VULKAN
+    for (int e = 0; e < c->n_experts; e++)
+        if (vkt_resident(layer, e))
+            gpu_bits[e >> 3] |= (unsigned char)(1u << (e & 7));
+#endif
     float sketch[G53_TRACE_SKETCH] = {0};
     /* A signed bucketed projection from the normalized attention output. */
     for (int i = 0; i < c->hidden; i++) {
@@ -1845,10 +1866,10 @@ static void g53_expert_trace_route(GModel *m, int layer, int row,
         sketch[bucket] += signed_value;
     }
     const float normalizer = (float)c->hidden / G53_TRACE_SKETCH;
-    fprintf(g53_trace_fp, "{\"v\":1,\"call\":%d,\"row\":%d,\"layer\":%d,\"n_experts\":%d,\"topk\":%d,"
+    fprintf(g53_trace_fp, "{\"v\":2,\"call\":%d,\"row\":%d,\"layer\":%d,\"n_experts\":%d,\"topk\":%d,"
             "\"host_slots\":%d,\"host_capacity\":%d,\"ids\":[",
             g53_trace_step, row, layer, c->n_experts, topk,
-            cache->n, cache->cap);
+            cache ? cache->n : 0, cache ? cache->cap : 0);
     for (int k = 0; k < topk; k++) fprintf(g53_trace_fp, "%s%d", k?",":"", ids[k]);
     fputs("],\"gates\":[", g53_trace_fp);
     for (int k = 0; k < topk; k++) fprintf(g53_trace_fp, "%s%.8g", k?",":"", gates[k]);
@@ -1861,11 +1882,17 @@ static void g53_expert_trace_route(GModel *m, int layer, int row,
         if (vkt_resident(layer, eid)) state = 2;
         else
 #endif
-        for (int j = 0; j < cache->n; j++)
+        for (int j = 0; cache && j < cache->n; j++)
             if (cache->s[j].eid == eid) { state = 1; break; }
         fprintf(g53_trace_fp, "%s%d", k?",":"", state);
     }
-    fputs("],\"sketch\":[", g53_trace_fp);
+    fputs("],\"host_mask\":\"", g53_trace_fp);
+    for (int b = 0; b < (c->n_experts + 7) / 8; b++)
+        fprintf(g53_trace_fp, "%02x", (unsigned)host_bits[b]);
+    fputs("\",\"gpu_mask\":\"", g53_trace_fp);
+    for (int b = 0; b < (c->n_experts + 7) / 8; b++)
+        fprintf(g53_trace_fp, "%02x", (unsigned)gpu_bits[b]);
+    fputs("\",\"sketch\":[", g53_trace_fp);
     for (int j = 0; j < G53_TRACE_SKETCH; j++)
         fprintf(g53_trace_fp, "%s%.8g", j?",":"", sketch[j]/normalizer);
     fputs("]}\n", g53_trace_fp);

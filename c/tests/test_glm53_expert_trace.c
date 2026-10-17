@@ -32,8 +32,11 @@ int main(void) {
     char buf[4096];
     if(!fgets(buf,sizeof buf,f))return 5;
     fclose(f);
-    if(!strstr(buf,"\"ids\":[7,8,9,10,11,12,13,14]") ||
+    if(!strstr(buf,"\"v\":2") ||
+       !strstr(buf,"\"ids\":[7,8,9,10,11,12,13,14]") ||
        !strstr(buf,"\"resident\":[1,0,0,0,0,0,0,0]") ||
+       !strstr(buf,"\"host_mask\":\"80") ||
+       !strstr(buf,"\"gpu_mask\":\"0000") ||
        !strstr(buf,"\"sketch\"") || strstr(buf,"prompt")){
         fputs("FAIL missing data or prompt leak\n",stderr);return 6;
     }
@@ -48,8 +51,24 @@ int main(void) {
     if(!WIFEXITED(status)||WEXITSTATUS(status)==0){
         fputs("FAIL existing trace was not refused\n",stderr);return 7;
     }
-    unlink(path);rmdir(root);
+    /* A completely non-streaming engine has no LCache array at all. It must
+     * still be traceable without touching the native resident Mat experts. */
     free(model.ecache[3].s);free(model.ecache);
+    model.ecache=NULL;
+    char second[512];snprintf(second,sizeof second,"%s/nonstream.jsonl",root);
+    g53_trace_fp=NULL;g53_trace_init_done=0;
+    setenv("GLM53_EXPERT_TRACE",second,1);
+    g53_expert_trace_route(&model,3,0,features,chosen,gates,8);
+    g53_expert_trace_close();
+    FILE *f2=fopen(second,"r");
+    if(!f2 || !fgets(buf,sizeof buf,f2))return 8;
+    fclose(f2);
+    if(!strstr(buf,"\"host_capacity\":0") ||
+       !strstr(buf,"\"resident\":[0,0,0,0,0,0,0,0]")){
+        fputs("FAIL nonstreamed cache null protection\n",stderr);return 9;
+    }
+    unlink(second);
+    unlink(path);rmdir(root);
     puts("PASS expert trace: known residency, minimal sketch, 0600, and exclusive-create denial");
     return 0;
 }
