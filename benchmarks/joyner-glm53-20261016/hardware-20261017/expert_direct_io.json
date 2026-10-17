@@ -1,0 +1,55 @@
+{
+  "date_utc": "2026-10-17T05:21:26Z",
+  "source": "verified manifest-listed GLM-5.3-Flash Colibri int4 expert tensors",
+  "source_shards": 62,
+  "sample_candidates": 37148,
+  "median_tensor_MiB": 4.0,
+  "min_tensor_MiB": 4.0,
+  "max_tensor_MiB": 4.0,
+  "tests": [
+    {
+      "workers": 1,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.13,
+      "direct_GBps": 8.269,
+      "p50_ms": 0.488,
+      "p95_ms": 0.569,
+      "p99_ms": 0.738
+    },
+    {
+      "workers": 2,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.096,
+      "direct_GBps": 11.219,
+      "p50_ms": 0.698,
+      "p95_ms": 0.938,
+      "p99_ms": 1.662
+    },
+    {
+      "workers": 4,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.093,
+      "direct_GBps": 11.54,
+      "p50_ms": 1.39,
+      "p95_ms": 1.651,
+      "p99_ms": 2.635
+    },
+    {
+      "workers": 8,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.096,
+      "direct_GBps": 11.23,
+      "p50_ms": 2.856,
+      "p95_ms": 3.146,
+      "p99_ms": 4.494
+    }
+  ]
+}

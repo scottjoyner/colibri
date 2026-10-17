@@ -1,0 +1,109 @@
+{
+  "date": "2026-10-17",
+  "machine": "joyner",
+  "GPU_PCI_ID": "1002:7551",
+  "vulkan_device": "AMD Radeon Graphics RADV GFX1201",
+  "source": "zai-org/GLM-5.3-Flash",
+  "revision": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "sample_shard": "model-00002-of-00062.safetensors",
+  "source_verified_before_test": true,
+  "O_DIRECT": true,
+  "memory_cap_GiB": 1,
+  "swap_cap_GiB": 0,
+  "production_services_unchanged": true,
+  "test_shape": {
+    "paired_trials": 3,
+    "samples_per_trial": 128,
+    "distinct_regions_across_trials": 384,
+    "bytes_per_region": 4194304
+  },
+  "paired_trials": [
+    {
+      "trial": 1,
+      "serial_GBps": 3.951,
+      "double_buffer_GBps": 4.756,
+      "improvement_pct": 20.37,
+      "serial_p99_read_ms": 0.702,
+      "double_buffer_p99_read_ms": 1.419,
+      "serial_p99_gpu_ms": 0.252,
+      "double_buffer_p99_gpu_ms": 0.53
+    },
+    {
+      "trial": 2,
+      "serial_GBps": 3.954,
+      "double_buffer_GBps": 4.766,
+      "improvement_pct": 20.54,
+      "serial_p99_read_ms": 0.605,
+      "double_buffer_p99_read_ms": 1.383,
+      "serial_p99_gpu_ms": 0.253,
+      "double_buffer_p99_gpu_ms": 0.515
+    },
+    {
+      "trial": 3,
+      "serial_GBps": 3.954,
+      "double_buffer_GBps": 4.664,
+      "improvement_pct": 17.96,
+      "serial_p99_read_ms": 0.688,
+      "double_buffer_p99_read_ms": 1.726,
+      "serial_p99_gpu_ms": 0.25,
+      "double_buffer_p99_gpu_ms": 0.593
+    }
+  ],
+  "median_serial_GBps": 3.954,
+  "median_double_buffer_GBps": 4.756,
+  "median_improvement_pct": 20.37,
+  "direct_io_sweep": [
+    {
+      "workers": 1,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.13,
+      "direct_GBps": 8.269,
+      "p50_ms": 0.488,
+      "p95_ms": 0.569,
+      "p99_ms": 0.738
+    },
+    {
+      "workers": 2,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.096,
+      "direct_GBps": 11.219,
+      "p50_ms": 0.698,
+      "p95_ms": 0.938,
+      "p99_ms": 1.662
+    },
+    {
+      "workers": 4,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.093,
+      "direct_GBps": 11.54,
+      "p50_ms": 1.39,
+      "p95_ms": 1.651,
+      "p99_ms": 2.635
+    },
+    {
+      "workers": 8,
+      "completed": 256,
+      "read_GB": 1.075,
+      "payload_GB": 1.074,
+      "elapsed_s": 0.096,
+      "direct_GBps": 11.23,
+      "p50_ms": 2.856,
+      "p95_ms": 3.146,
+      "p99_ms": 4.494
+    }
+  ],
+  "known_limitations": [
+    "isolated microbenchmark, no simultaneous GLM inference",
+    "short O_DIRECT reads may hit SSD controller cache",
+    "one GPU readback checks final 4MiB payload per trial, not each transfer",
+    "Vulkan fence/submission time includes CPU driver scheduling",
+    "double-buffer p99 tail spikes significantly worse",
+    "no inference token-per-second benefit yet"
+  ]
+}
