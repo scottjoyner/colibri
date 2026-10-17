@@ -1,0 +1,274 @@
+{
+  "schema": 1,
+  "models_read_only": true,
+  "all_modes_token_exact": true,
+  "vulkan": true,
+  "results": {
+    "resident": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [],
+      "experts": [],
+      "elapsed_ms": 34.85
+    },
+    "legacy": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "3",
+        "bytes",
+        "82944"
+      ],
+      "elapsed_ms": 36.21
+    },
+    "grouped": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [
+        "experts",
+        "3",
+        "calls",
+        "6"
+      ],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "3",
+        "bytes",
+        "82944"
+      ],
+      "elapsed_ms": 32.75
+    },
+    "vector": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [
+        "experts",
+        "3",
+        "calls",
+        "6"
+      ],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "3",
+        "bytes",
+        "82944"
+      ],
+      "elapsed_ms": 31.64
+    },
+    "mmap_legacy": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "0",
+        "bytes",
+        "0"
+      ],
+      "elapsed_ms": 32.31
+    },
+    "mmap_grouped": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [
+        "experts",
+        "0",
+        "calls",
+        "0"
+      ],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "0",
+        "bytes",
+        "0"
+      ],
+      "elapsed_ms": 32.72
+    },
+    "mmap_vector": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [
+        "experts",
+        "0",
+        "calls",
+        "0"
+      ],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "0",
+        "bytes",
+        "0"
+      ],
+      "elapsed_ms": 32.21
+    },
+    "force": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [
+        "experts",
+        "3",
+        "calls",
+        "6"
+      ],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "3",
+        "bytes",
+        "82944"
+      ],
+      "elapsed_ms": 32.89
+    },
+    "force_vector": {
+      "teacher_forcing": [
+        "63",
+        "63",
+        "63",
+        "100",
+        "169",
+        "184",
+        "211",
+        "34"
+      ],
+      "greedy": [
+        "34",
+        "121",
+        "34"
+      ],
+      "grouped": [
+        "experts",
+        "3",
+        "calls",
+        "6"
+      ],
+      "experts": [
+        "hits",
+        "0",
+        "miss",
+        "3",
+        "bytes",
+        "82944"
+      ],
+      "elapsed_ms": 32.42
+    }
+  }
+}
