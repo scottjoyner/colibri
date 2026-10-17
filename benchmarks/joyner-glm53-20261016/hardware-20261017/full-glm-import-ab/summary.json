@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "benchmark": "GLM53 forced staged upload importer A/B",
+  "model_revision": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+  "prompt_ids": [
+    11,
+    21,
+    13
+  ],
+  "requested_decode_tokens": 8,
+  "memory_limit_bytes": 6442450944,
+  "unit_swap_bytes": 0,
+  "common_flags": {
+    "COLI_VK_STAGED": "1",
+    "COLI_VK_CHAIN": "1",
+    "COLI_VK_TIER_GB": "2",
+    "GLM53_BITS": "4",
+    "GLM53_EXPERT_GB": "0.05"
+  },
+  "import_disabled": {
+    "completed": true,
+    "wall_seconds_controller": 48,
+    "load_seconds": 30.1,
+    "prefill_seconds": 5.1,
+    "decode_tokens": 8,
+    "decode_seconds": 12.7,
+    "tokens_per_second": 0.63,
+    "greedy_ids": [
+      16,
+      11,
+      21,
+      13,
+      17,
+      11,
+      21,
+      13
+    ],
+    "reported_staged_MiB": 6382.1,
+    "reported_staged_copies": 2147,
+    "reported_imported_MiB": 0.0,
+    "reported_import_copies": 0
+  },
+  "import_enabled": {
+    "completed": false,
+    "minimum_observed_seconds": 136,
+    "load_seconds": 30.3,
+    "prefill_seconds": 5.0,
+    "tokens_per_second": null,
+    "native_output_parity_verified": false,
+    "node_PSI_full_avg60_percent_during_run": 20.59,
+    "node_MemAvailable_kib_during_run": 198828,
+    "exit": "operator-stopped to avoid prolonged memory pressure"
+  },
+  "production_health": {
+    "18320": 200,
+    "18321": 200
+  },
+  "real_inference_speedup_proven": false,
+  "interpretation": "Standalone persistent-import throughput does not predict this many-short-lived-import inference path. The node-wide memory PSI is correlation, not proof of root cause.",
+  "source_sha256": {
+    "run_real_glm_import_ab.sh": "161a53a2973a39074e7d55ea858400d741947464d4352f571bc1577d89dceb7d",
+    "full_glm_staged_host_import.log": "e0f7fe9e0cf40f618a684175720717a6f7ecbc6f805abfc35242ddd9b3fdd49c",
+    "full_glm_staged_no_import.log": "a89faeea767239a69c0011b19b3de1596ffb4f91084df966b57ce27867cfeae1",
+    "full_glm_import_ab_control.log": "a5f5029ed76eb7871b8fa2a1250e4cdf43998476dcdc28f36cb4d52227b2a5da"
+  }
+}
