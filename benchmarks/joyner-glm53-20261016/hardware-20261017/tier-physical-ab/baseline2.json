@@ -1,0 +1,23 @@
+{
+  "binary_sha256": "b93d7e4fcbacf849438dde0f31b8b3434527bcf9e819d85698248044c53cc7ac",
+  "completed": false,
+  "decode_s": null,
+  "duration_s": 32.35,
+  "engine_rss_gib": null,
+  "exit_code": -15,
+  "expert_bytes": null,
+  "expert_misses": null,
+  "gpu_routed": null,
+  "gpu_served": null,
+  "gpu_uploads": null,
+  "greedy_ids": null,
+  "max_psi_full_avg10": 2.99,
+  "max_psi_some_avg10": 2.99,
+  "min_available_kib": 759200,
+  "mode": "baseline2",
+  "rate": 16,
+  "stop_reason": "memory_pressure",
+  "tier_gib": 2.0,
+  "tok_s": null,
+  "unit": "glm53-tier-ab-bd5056adf55c"
+}
