@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import uuid
+from glm53_competitors import sample as sample_competitors
 
 UNITS=("fleet-r9700-vulkan-canary.service","fleet-r9700-toolcall.service")
 GPU_DEV=Path("/dev/dri/renderD128")
@@ -90,8 +91,16 @@ def preflight():
             if int(pid) not in pids.values() and comm not in ("ps",):
                 heavy.append({"pid":int(pid),"cpu_percent":float(cpu),"rss_kib":int(rss),"comm":comm})
     if heavy:raise RuntimeError("NO_GO unknown heavy CPU/RAM competitors: "+json.dumps(heavy))
-    return {"originally_running":original,"canary_pids":pids,"initial_gpu_users":gpu_users(),
-            "health":health(),"unknown_gpu_users":unknown,"heavy_unknown":heavy}
+    activity=sample_competitors(duration_s=1.0,
+                                exclude_pids=frozenset((os.getpid(),*pids.values())))
+    if activity["competitors"]:
+        raise RuntimeError("NO_GO CPU / SSD / RAM competitors: "+json.dumps(activity["competitors"]))
+    if activity["global_nvme_bytes_per_sec"]>=32*1024*1024:
+        raise RuntimeError("NO_GO NVMe background traffic high before test: "+str(activity["global_nvme_bytes_per_sec"]))
+    return {"originally_running":original,"canary_pids":pids,
+            "initial_gpu_users":gpu_users(),
+            "health":health(),"unknown_gpu_users":unknown,
+            "heavy_unknown":heavy,"cpu_io_baseline":activity}
 
 def restart_and_verify(original):
     to_start=[u for u,was_running in original.items() if was_running]
@@ -127,6 +136,12 @@ def main():
     with LOCK.open("w") as locked:
         try:fcntl.flock(locked,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError("NO_GO GLM exclusive benchmark already active")
+        # Claim the exclusive lock first, then remove ONLY leftover scopes
+        # from this exact GLM benchmark namespace. Unknown workloads remain
+        # untouched and cause a denial in preflight() instead.
+        from exclusive_joyner_restore import stop_owned_scopes
+        stale=stop_owned_scopes()
+        if stale:print("EXCLUSIVE_STOPPED_STALE_BENCH_SCOPES",stale,flush=True)
         before=preflight()
         print("EXCLUSIVE_PREFLIGHT",json.dumps(before,sort_keys=True),flush=True)
         if a.dry_run:
@@ -156,7 +171,16 @@ def main():
                 time.sleep(1)
             if any(active(u) for u in UNITS) or gpu_users():
                 raise RuntimeError("NO_GO GPU still held after stopping exact canary units; "+str(gpu_users()))
+            # An independently launched workload may start while services
+            # are draining. Never knowingly benchmark with that contention.
+            quiet=sample_competitors(duration_s=1.0,
+                                     exclude_pids=frozenset((os.getpid(),)))
+            if quiet["competitors"]:
+                raise RuntimeError("NO_GO residual CPU/SSD workload: "+json.dumps(quiet["competitors"]))
+            if quiet["global_nvme_bytes_per_sec"]>=32*1024*1024:
+                raise RuntimeError("NO_GO residual NVMe background traffic: "+str(quiet["global_nvme_bytes_per_sec"]))
             print("EXCLUSIVE_GPU_CLEAR",flush=True)
+            print("EXCLUSIVE_CPU_SSD_CLEAR",json.dumps(quiet,sort_keys=True),flush=True)
             receipts=[]
             for label in labels:receipts.append(run_trial(label))
             succeeded=True

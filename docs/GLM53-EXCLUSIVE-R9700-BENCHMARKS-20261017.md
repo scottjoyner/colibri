@@ -42,3 +42,42 @@ On Joyner, use the pinned shadow directory. First invoke exclusive_joyner_benchm
 Tests: test_glm53_competition_guard.py (five checks); test_glm53_benchmark_isolation.py (four checks). Aggregate receipts live in hardware-20261017/exclusive-r9700.
 
 The GLM production admission decision remains HOLD.
+
+## Stronger CPU, SSD and GPU exclusion (2026-10-17 follow-up)
+
+The GPU-only check was insufficient for a full-model performance claim. The
+new glm53_competitors.py uses monotonic, paired /proc readings to measure
+per-process CPU ticks, block read_bytes+write_bytes and resident RAM;
+process starttime detects PID reuse. The two known canary service PIDs are
+excluded *only* during the pre-stop inventory; once they have been stopped,
+the exclusive runner expects them to remain stopped.
+
+A benchmark is refused if a competitor uses >=0.80 CPU cores or >=32 MiB/s
+of disk read+write bandwidth, or holds >=2 GiB RSS. The new preflight also
+samples aggregate /sys/block/nvme0n1/stat; >=32 MiB/s of background NVMe
+traffic is a NO_GO before launch. During GLM execution, global block traffic
+includes the benchmark itself, so the periodic guard instead checks other
+processes and the exact R9700 GPU device holder list every ~4 seconds.
+
+The trial's own process group is excluded only by its exact, transient
+systemd scope name. An unexpected GPU holder, heavy user/system process,
+or restart of either known canary triggers watchdog cleanup, NOT a
+contaminated speed result. The exclusive controller removes leftover scopes
+from its own exact GLM benchmark namespace before starting, after taking
+its exclusive lock. It never generically kills a by-name match or a
+network/storage/OS service.
+
+I/O attribution has known limits: on Joyner, /proc/PID/io was inaccessible
+for 416 of 495 scanned PIDs (mostly system/kthreads/other users), although
+the process identities and CPU counters were visible. The aggregate NVMe
+sample was idle, and a controlled synthetic CPU competitor was detected.
+This does **not** prove zero privileged background disk I/O during each
+forward: it is an explicit measurement limitation rather than a success
+claim. In a more tightly controlled lab, stronger per-cgroup I/O or block
+telemetry is necessary.
+
+Validation: 12 process-scanner unit tests, 7 watchdog tests, 4 restoration
+tests pass. The latest dry run inspected 495 processes, found no unexpected
+high-activity process or NVMe work, left the two canaries running, and
+verified both endpoints returned HTTP 200. No new full-model throughput
+measurement was run for this guard-only change.

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+from glm53_competitors import scan as scan_processes, observe as observe_processes
 
 STAGE = Path("/srv/joyner-gen5/colibri-fork-dense-stage")
 MODEL = Path("/srv/joyner-gen5/models/glm53_colibri_i4")
@@ -102,6 +103,37 @@ def competition_violation(*,isolated:bool)->str|None:
     except Exception:
         return "production_health_check_failed"
 
+def exclusive_gpu_competitors(scope:str)->list[int]:
+    """GPU users not bound to the exact current transient benchmark scope."""
+    check=subprocess.run(["fuser","-a","/dev/dri/renderD128"],
+                         capture_output=True,text=True,timeout=6)
+    if check.returncode not in (0,1):
+        raise RuntimeError("NO_GO GPU ownership query failed")
+    others=[]
+    for pid in {int(p) for p in re.findall(r"\b\d+\b",check.stdout)}:
+        try:
+            cgroup=(Path("/proc")/str(pid)/"cgroup").read_text()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            others.append(pid);continue
+        # Require an exact cgroup path component. Substring matches could
+        # incorrectly exempt a differently named competitor scope.
+        paths=[line.split(":",2)[-1].strip() for line in cgroup.splitlines()]
+        if not any((scope+".scope") in entry.split("/") for entry in paths):
+            others.append(pid)
+    return sorted(others)
+
+def exclusive_competition_scan(previous:dict,elapsed_s:float,scope:str):
+    latest,unreadable=scan_processes()
+    if elapsed_s<=0:raise RuntimeError("NO_GO invalid process sample duration")
+    hot=observe_processes(previous,latest,elapsed_s,
+                          excluded_scope=scope+".scope",
+                          exclude_pids=frozenset((os.getpid(),)))
+    gpu=exclusive_gpu_competitors(scope)
+    return latest,{"cpu_or_ssd":hot,"gpu_users":gpu,
+                   "unknown_pid_reads":unreadable}
+
 def validate(binary:Path,output:Path,*,isolated:bool=False):
     if os.uname().nodename!="joyner":raise RuntimeError("NO_GO not Joyner")
     if not binary.is_file() or not os.access(binary,os.X_OK):raise RuntimeError("NO_GO binary absent")
@@ -161,6 +193,10 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
     events=[]
     bad_streak=0
     start=time.monotonic()
+    proc_prev,initial_unknown=scan_processes() if isolated else ({},0)
+    proc_sample_at=start
+    observed_competitors=[]
+
     result={"mode":label,"tier_gib":tier,"rate":rate,"dense_host":dense_host,"text_only":text_only,"fair_layers":fair_layers, "expert_gb":expert_gb,"isolated":isolated,"unit":unit,"binary_sha256":
              hashlib.sha256(binary.read_bytes()).hexdigest(),"completed":False}
     with logfile.open("x") as logs,metrics.open("x") as samples:
@@ -182,6 +218,15 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
                 if int(elapsed)%4==0:
                     violation=competition_violation(isolated=isolated)
                     if violation:result["stop_reason"]=violation
+                if isolated and time.monotonic()-proc_sample_at>=4:
+                    next_proc,contenders=exclusive_competition_scan(
+                        proc_prev,time.monotonic()-proc_sample_at,unit)
+                    proc_prev=next_proc
+                    proc_sample_at=time.monotonic()
+                    if contenders["cpu_or_ssd"] or contenders["gpu_users"]:
+                        observed_competitors.append(
+                            {"at_s":round(elapsed,2),**contenders})
+                        result["stop_reason"]="unexpected_cpu_disk_or_gpu_competitor"
                 if result.get("stop_reason"):
                     subprocess.run(["systemctl","--user","stop",unit+".scope"],
                                    capture_output=True,timeout=10)
@@ -217,6 +262,9 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
     miss=re.search(r"^experts hits (\d+) miss (\d+) bytes (\d+)",log,re.M)
     memory=re.search(r"RSS ([\d.]+) GiB",log)
     result.update({"duration_s":round(time.monotonic()-start,2),
+       "competitors_detected":observed_competitors,
+       "initial_unreadable_proc_entries":initial_unknown,
+
        "max_gpu_vram_used_bytes":max((x.get("gpu_vram_used_bytes",0) for x in events),default=0),
        "min_available_kib":min(x["mem_available_kib"] for x in events),
        "max_psi_full_avg10":max(x["full_avg10"] for x in events),
