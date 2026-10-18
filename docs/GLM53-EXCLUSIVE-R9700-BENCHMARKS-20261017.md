@@ -126,3 +126,39 @@ exclusive4control-<12 lowercase hex> and exclusive4fair-<12 lowercase hex>
 only with --isolated and only at the pinned 4 GiB / 32-promotion configuration.
 Two additional tests verify unique round labels cannot bypass GPU isolation.
 The old results are preserved and remain independently auditable.
+
+## Follow-up paired real-checkpoint benchmark — 2026-10-17 20:47–20:50 EDT
+
+The exclusive controller completed an additional physical same-binary A/B
+on Joyner with both R9700 canary services stopped, after a clear CPU, GPU and
+Gen5 SSD preflight. Unique round ID: a5c017204700.
+
+| Measurement | Control | Fair-share |
+| --- | ---: | ---: |
+| Decode throughput | 0.373 tokens/s | 0.400 tokens/s |
+| GPU experts served / 3696 | 418 | 565 |
+| SSD expert misses | 3114 | 2961 |
+| GPU uploads | 326 | 270 |
+| Engine RSS | 3.38 GiB | 3.38 GiB |
+| Lowest host MemAvailable | 8,863,140 KiB | 8,847,288 KiB |
+| Maximum memory PSI avg10 full | 0.18 | 0.00 |
+| Detected competitors | 0 | 0 |
+| Greedy output | 16 11 21 13 17 11 21 13 | exactly identical |
+
+The fair-share configuration was 7.24% faster in this pair using pinned
+binary SHA-256:
+7107c88241266da8bfcbb7ba82683dc93b4bca53ee7fd54584d2813f5ca247d1.
+This is an additional single matched pair, not production-ready statistical
+evidence. It corroborates the earlier isolated 0.376 -> 0.403 tok/s result
+while showing full-checkpoint interactive speed remains unacceptably low.
+
+Physical controller outcome: EXCLUSIVE_RESTORE True; both original canary
+endpoints 18320 and 18321 returned HTTP 200 after recovery, with new healthy
+PIDs, no orphan GLM systemd scope, no restoration timer, and memory pressure
+avg10 back to 0. No other disposable CPU/SSD/GPU workload required
+termination in this run. The only known competing processes were the two
+canaries explicitly stopped and restored. Raw JSON receipts are:
+- benchmarks/joyner-glm53-20261016/exclusive4control-a5c017204700.json
+- benchmarks/joyner-glm53-20261016/exclusive4fair-a5c017204700.json
+
+GLM production admission remains HOLD.
