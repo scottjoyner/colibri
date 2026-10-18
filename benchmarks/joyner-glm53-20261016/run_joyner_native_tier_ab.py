@@ -159,7 +159,7 @@ def validate(binary:Path,output:Path,*,isolated:bool=False):
             if not check_endpoint(port):
                 raise RuntimeError("NO_GO unhealthy existing inference endpoint")
 
-def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:int,text_only:int,fair_layers:int,expert_gb:float,*,isolated:bool=False):
+def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:int,text_only:int,fair_layers:int,expert_gb:float,*,isolated:bool=False,single_row_stream:int=0):
     unit="glm53-tier-ab-"+uuid.uuid4().hex[:12]
     logfile=output.parent/(label+".log")
     metrics=output.parent/(label+"_pressure.jsonl")
@@ -175,6 +175,7 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
        "COLI_VK_TIER_REPEAT_ADMIT":"0","GLM53_COALESCED_EXPERT_IO":"vector",
        "GLM53_TEXT_ONLY":str(text_only),
        "COLI_VK_TIER_FAIR_LAYERS":str(fair_layers),
+       "COLI_VK_TIER_SINGLE_ROW_STREAM":str(single_row_stream),
        "USAGE_SAVE":"0","KVSAVE":"0","OMP_NUM_THREADS":"2"}
     env.pop("GLM53_HOST_IMPORT_EXPERIMENT",None)
     cmd=["systemd-run","--user","--scope","--unit",unit,"--collect","--quiet",
@@ -188,7 +189,8 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
             "COLI_VK_TIER_RATE","COLI_VK_TIER_WARM","COLI_VK_TIER_FILL",
             "COLI_VK_STAGED","COLI_VK_UP_IMPORT","COLI_VK_UP_POOL",
             "COLI_VK_TIER_REPEAT_ADMIT","GLM53_COALESCED_EXPERT_IO",
-            "GLM53_TEXT_ONLY","COLI_VK_TIER_FAIR_LAYERS","USAGE_SAVE","KVSAVE","OMP_NUM_THREADS")],
+            "GLM53_TEXT_ONLY","COLI_VK_TIER_FAIR_LAYERS",
+            "COLI_VK_TIER_SINGLE_ROW_STREAM","USAGE_SAVE","KVSAVE","OMP_NUM_THREADS")],
          str(binary),"--model",str(MODEL),"--ids","11,21,13","--greedy","8"]
     # Capture the process output directly rather than requiring journal access.
     events=[]
@@ -268,7 +270,8 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
     uploads=re.search(r"uploads (\d+) \(",log)
     miss=re.search(r"^experts hits (\d+) miss (\d+) bytes (\d+)",log,re.M)
     memory=re.search(r"RSS ([\d.]+) GiB",log)
-    result.update({"duration_s":round(time.monotonic()-start,2),
+    result.update({"single_row_stream":single_row_stream,
+       "duration_s":round(time.monotonic()-start,2),
        "competitors_detected":observed_competitors,
        "initial_unreadable_proc_entries":initial_unknown,
 
@@ -285,6 +288,8 @@ def run_trial(binary:Path,output:Path,label:str,tier:float,rate:int,dense_host:i
        "expert_misses":int(miss[2]) if miss else None,
        "expert_bytes":int(miss[3]) if miss else None,
        "engine_rss_gib":float(memory[1]) if memory else None})
+    if single_row_stream and "[VK] tier glm53: EXPERIMENTAL one-row cold-expert GPU staging enabled" not in log:
+        result["stop_reason"]="experimental_feature_not_activated"
     result["completed"]=(not result.get("stop_reason") and
                          result.get("exit_code")==0 and decode is not None and
                          int(decode[1])==8 and greedy is not None and
@@ -304,6 +309,8 @@ def main():
     pa.add_argument("--dense-host",required=True,type=int,choices=(0,1))
     pa.add_argument("--text-only",required=True,type=int,choices=(0,1))
     pa.add_argument("--fair-layers",type=int,default=0,choices=(0,1))
+    pa.add_argument("--single-row-stream",type=int,default=0,choices=(0,1),
+                    help="experimental one-token GPU cold-expert streaming; isolated only")
     pa.add_argument("--expert-gb",type=float,default=0.05)
     pa.add_argument("--isolated",action="store_true",
                     help="Require both competing R9700 canaries already stopped by exclusive wrapper")
@@ -319,10 +326,13 @@ def main():
              (4.0,32,0,1,1,"exclusive4fair"),
              (4.0,32,0,1,0,"exclusive4control2"),
              (4.0,32,0,1,1,"exclusive4fair2")}
-    dynamic=re.fullmatch(r"exclusive4(control|fair)-[0-9a-f]{12}",a.label)
+    dynamic=re.fullmatch(r"exclusive4(control|fair|stream)-[0-9a-f]{12}",a.label)
     valid_dynamic=(dynamic is not None and a.isolated and
                    (a.tier_gib,a.rate,a.dense_host,a.text_only)==(4.0,32,0,1)
-                   and a.fair_layers==(1 if dynamic.group(1)=="fair" else 0))
+                   and a.fair_layers==(0 if dynamic.group(1)=="control" else 1)
+                   and a.single_row_stream==int(dynamic.group(1)=="stream"))
+    if a.single_row_stream and not valid_dynamic:
+        raise SystemExit("NO_GO one-row streaming requires the pinned isolated experimental label")
     if ((a.tier_gib,a.rate,a.dense_host,a.text_only,a.fair_layers,a.label)
          not in allowed and not valid_dynamic):
         raise SystemExit("NO_GO only pinned benchmark configurations")
@@ -333,7 +343,7 @@ def main():
     report=a.out_dir/(a.label+".json")
     validate(a.binary,report,isolated=a.isolated)
     r=run_trial(a.binary,report,a.label,a.tier_gib,a.rate,a.dense_host,a.text_only,a.fair_layers,a.expert_gb,
-                isolated=a.isolated)
+                isolated=a.isolated,single_row_stream=a.single_row_stream)
     print(json.dumps(r,sort_keys=True),flush=True)
     if not r["completed"]:sys.exit(15)
     if a.isolated:

@@ -130,7 +130,7 @@ static struct {
     unsigned long long rep_routed, rep_served;
     int plan_hist;  /* upstream cfab4f65 warm-plan history count */
     /* streaming (big prefill steps; see "streaming" below) */
-    int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par;
+    int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par, single_row_stream;
     VStage *st;
     double bw_up, cpu_row_ms;             /* measured: bytes per ms into a slot; CPU ms per (row, expert) */
     int big, big_fail, big_n, big_taken, said_fwd;
@@ -941,7 +941,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     }
     /* the rows grouped by expert, each expert's in routing order; its class */
     if (!grow_int(&T.blist, &T.cblist, n) || !grow_map(n)) return 0;
-    int at = 0, R = stream_min_rows();
+    int at = 0, R = (S == 1 && T.single_row_stream) ? 1 : stream_min_rows();
     for (int e = 0; e < E; e++) {
         ofs[e] = at; at += cnt[e];
         VSlot *v = slot(layer, e);
@@ -1260,7 +1260,9 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     }
     T.last_layer = layer;
     quiesce();
-    if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) return issue_big(layer, x, S, K, idx, w, taken);
+    if (T.st_ok && layer < T.main_layers &&
+        (S >= T.gemm_rows || (S == 1 && T.single_row_stream)))
+        return issue_big(layer, x, S, K, idx, w, taken);
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
     /* heat for every routed expert, groups for the resident ones (first seen first) */
@@ -1563,6 +1565,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     T.fair_layers=!strcmp(T.engine,"glm53") && fair_flag && !strcmp(fair_flag,"1");
     if (T.fair_layers)
         fprintf(stderr,"[VK] tier glm53: EXPERIMENTAL causal rotating layer quotas enabled; total promotions/token unchanged\n");
+    const char *single_flag=getenv("COLI_VK_TIER_SINGLE_ROW_STREAM");
+    T.single_row_stream=!strcmp(T.engine,"glm53") &&
+        single_flag && !strcmp(single_flag,"1");
+    if (T.single_row_stream)
+        fprintf(stderr,"[VK] tier glm53: EXPERIMENTAL one-row cold-expert GPU staging enabled; bounded CPU fallback remains active\n");
     if (T.c.layers < 1 || T.c.experts < 1 || T.c.hidden < 1 || T.c.inter < 1 || T.c.topk < 1) return 0;
     T.main_layers = T.c.layers;
     if (!form_init(0, T.c.gate_up, T.c.down)) {

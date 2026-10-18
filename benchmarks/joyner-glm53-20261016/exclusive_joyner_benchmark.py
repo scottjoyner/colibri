@@ -32,6 +32,8 @@ TARGET="100.83.215.83"
 PORTS=(18320,18321)
 RUNNER=Path("/home/joyner/glm53-native-runtime-shadow-20261017/run_joyner_native_tier_ab.py")
 MODEL_BINARY=Path("/home/joyner/glm53-native-runtime-shadow-20261017/glm53-final-candidate-vulkan-20261017")
+EXPERIMENT_BINARY=Path("/home/joyner/glm53-native-runtime-shadow-20261017/glm53-single-row-canary-20261017")
+EXPERIMENT_SHA256="b2cf18d0b98da29f868818ad52bd84dd2d33c70d0448edb201863ede250c74a0"
 RECEIPTS=Path("/home/joyner/glm53-native-runtime-shadow-20261017/physical_tier_ab_20261017")
 RESTORE_SCRIPT=RUNNER.with_name("exclusive_joyner_restore.py")
 RESTORE_AFTER="240s"
@@ -140,12 +142,14 @@ def restart_and_verify(original):
         time.sleep(1)
     return False
 
-def run_trial(label:str):
-    fair="1" if label.startswith("exclusive4fair-") else "0"
-    args=[sys.executable,str(RUNNER),"--binary",str(MODEL_BINARY),
+def run_trial(label:str,*,binary:Path=MODEL_BINARY):
+    fair="0" if label.startswith("exclusive4control-") else "1"
+    stream="1" if label.startswith("exclusive4stream-") else "0"
+    args=[sys.executable,str(RUNNER),"--binary",str(binary),
           "--out-dir",str(RECEIPTS),"--tier-gib","4","--rate","32",
           "--dense-host","0","--text-only","1","--fair-layers",fair,
-          "--expert-gb","0.05","--label",label,"--isolated"]
+          "--expert-gb","0.05","--label",label,
+          "--single-row-stream",stream,"--isolated"]
     print("EXCLUSIVE_TRIAL",label,flush=True)
     p=subprocess.run(args,capture_output=True,text=True,timeout=125)
     print("EXCLUSIVE_TRIAL_EXIT",label,p.returncode,flush=True)
@@ -157,11 +161,15 @@ def run_trial(label:str):
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--dry-run",action="store_true")
-    ap.add_argument("--single",choices=("control","fair"),
+    ap.add_argument("--single",choices=("control","fair","stream"),
                     help="run a single control or fair candidate instead of the pair")
+    ap.add_argument("--compare-single-stream",action="store_true",
+                    help="paired fair-share normal versus opt-in one-row streaming")
     ap.add_argument("--round-id",
                     help="optional 12-character lowercase hexadecimal receipt identity")
     a=ap.parse_args()
+    if a.single and a.compare_single_stream:
+        raise RuntimeError("NO_GO choose a single case or a pair, not both")
     if a.round_id and not re.fullmatch(r"[0-9a-f]{12}",a.round_id):
         raise RuntimeError("NO_GO round ID must be 12 lowercase hex characters")
     round_id=a.round_id or uuid.uuid4().hex[:12]
@@ -172,12 +180,21 @@ def main():
         # Validate output identity BEFORE any termination. Re-running a
         # completed case may never disrupt other jobs simply to return NO_GO.
         labels=([f"exclusive4{a.single}-{round_id}"] if a.single else
+                [f"exclusive4fair-{round_id}",f"exclusive4stream-{round_id}"]
+                if a.compare_single_stream else
                 [f"exclusive4control-{round_id}",f"exclusive4fair-{round_id}"])
         print("EXCLUSIVE_ROUND_ID",round_id,"CASES",labels,flush=True)
         if not a.dry_run:
             for name in labels:
                 if (RECEIPTS/(name+".json")).exists():
                     raise RuntimeError("NO_GO existing receipt "+name+"; never overwrite")
+            if a.compare_single_stream:
+                import hashlib
+                if not EXPERIMENT_BINARY.is_file():
+                    raise RuntimeError("NO_GO experimental binary absent")
+                binary_sha=hashlib.sha256(EXPERIMENT_BINARY.read_bytes()).hexdigest()
+                if binary_sha!=EXPERIMENT_SHA256:
+                    raise RuntimeError("NO_GO unexpected experimental binary hash")
         # Claim the exclusive lock first, then remove ONLY leftover scopes
         # from this exact GLM benchmark namespace. Unknown workloads remain
         # untouched and cause a denial in preflight() instead.
@@ -225,7 +242,9 @@ def main():
             print("EXCLUSIVE_GPU_CLEAR",flush=True)
             print("EXCLUSIVE_CPU_SSD_CLEAR",json.dumps(quiet,sort_keys=True),flush=True)
             receipts=[]
-            for label in labels:receipts.append(run_trial(label))
+            for label in labels:
+                receipts.append(run_trial(label,binary=EXPERIMENT_BINARY
+                                          if a.compare_single_stream else MODEL_BINARY))
             succeeded=True
             print("EXCLUSIVE_BENCH_RESULTS",json.dumps([
                 {"name":r["mode"],"tok_s":r["tok_s"],
