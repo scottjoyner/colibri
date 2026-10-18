@@ -1,0 +1,20 @@
+[Unit]
+Description=Independent xwing LAN witness for Joyner GLM53 reachability (NO inference routing)
+Documentation=https://github.com/scottjoyner/colibri/pull/18
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -B /home/scott/.local/lib/colibri-glm53-observer-20261018-v1/glm53_outage_observer.py --inference-base http://192.168.1.79:18320 --expected-model glm53 --local-health-base http://127.0.0.1:8899 --state-dir /home/scott/.local/state/colibri-glm53-observer-xwing
+TimeoutStartSec=15s
+MemoryMax=96M
+CPUQuota=15%
+TasksMax=16
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/scott/.local/state/colibri-glm53-observer-xwing
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1

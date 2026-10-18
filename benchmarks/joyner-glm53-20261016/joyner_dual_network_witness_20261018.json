@@ -1,0 +1,30 @@
+{
+  "checked_at_epoch_s": 1792341284,
+  "corroboration": "JOYNER_UNREACHABLE_BOTH_NETWORK_PATHS",
+  "decision": "HOLD",
+  "eligible_for_dispatch": false,
+  "failover_authorized": false,
+  "model_loaded_proven": false,
+  "reason": "both network observers confirmed transport failure",
+  "schema": 1,
+  "witnesses": [
+    {
+      "alarm": "REMOTE_UNREACHABLE",
+      "consecutive_failures": 51,
+      "decision": "HOLD",
+      "host": "x1-370",
+      "last_epoch_s": 1792341243,
+      "path_kind": "TAILNET",
+      "remote_state": "UNREACHABLE"
+    },
+    {
+      "alarm": "REMOTE_UNREACHABLE",
+      "consecutive_failures": 8,
+      "decision": "HOLD",
+      "host": "xwing",
+      "last_epoch_s": 1792341254,
+      "path_kind": "LAN",
+      "remote_state": "UNREACHABLE"
+    }
+  ]
+}

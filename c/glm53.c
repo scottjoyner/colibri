@@ -76,7 +76,7 @@
 #include "glm53_expert_read_plan.h"
 #include "glm53_expert_preadv.h"
 #include "glm53_import_safety.h"
-#include "glm53_import_safety.h"
+#include "glm53_visual_gate.h"
 #include "quant.h"
 #include "tok.h"
 #include "omp_tune.h"
@@ -2905,7 +2905,8 @@ static void g53_dho_finish(GModel *m, int fit_n, int fit_tail, int partial) {
         if (fit_tail) g53_dho_drop(&m->head, 0, 1, &b);
     }
     char kept[384];
-    snprintf(kept, sizeof kept, "the embedding (and a head tied to it), the routers, the mHC mixes and norms, the vision tower%s%s",
+    snprintf(kept, sizeof kept, "the embedding (and a head tied to it), the routers, the mHC mixes and norms%s%s%s",
+             m->has_vision ? ", the vision tower" : "",
              g_g53_dho_keep ? ", the absorbed kv_b (the chain will not run every forward: the CPU's attention reads it)" : "",
              partial ? ", the head (the chain's tail runs on the CPU)" : "");
     coli_vk_dense_host_placed("glm53", kept);
@@ -3109,12 +3110,33 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
 }
 
 /* ---------- vision ----------
- * La torre e' in vision_tower.h e non sa nulla di GLM: qui si riempiono solo i
+ * Opt-in split-capability fleet mode: skip *all* image tower weight loading,
+ * advertise CAPS vision=0 and reject image placeholders. The original model
+ * and service default remain unchanged. Text-only is a serving capability,
+ * not just an allocation hint: accepting IMAGE after skipping its weights
+ * would otherwise risk silently using text embeddings for image positions.
+ */
+static int glm53_text_only(void) {
+    const char *v=getenv("GLM53_TEXT_ONLY");
+    return v && strcmp(v,"1")==0;
+}
+static int glm53_text_only_visual_tokens(const Cfg *c,const int *tokens,int n) {
+    if(!glm53_text_only())return 0;
+    if(!c)return 1;
+    const int visual[]={c->image_token,c->image_start_token,c->image_end_token,
+                        c->video_token,c->video_start_token,c->video_end_token};
+    return glm53_visual_ids_present(visual,tokens,n);
+}
+/* La torre e' in vision_tower.h e non sa nulla di GLM: qui si riempiono solo i
  * puntatori ai pesi e si traduce la config. Il checkpoint solo-testo non porta
  * `model.visual.*` e allora has_vision resta 0: l'engine funziona identico. */
 static void vision_load(GModel *m) {
     const Cfg *c = &m->c;
     m->has_vision = 0;
+    if (glm53_text_only()) {
+        fprintf(stderr,"[GLM53] GLM53_TEXT_ONLY=1: vision tower NOT loaded; image inputs are refused\n");
+        return;
+    }
     if (c->vis_layers <= 0) return;
     if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) {
         /* La config annuncia una torre che il checkpoint non porta: si serve
@@ -4321,6 +4343,11 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     if (!sequence) { serve_line("ERROR %llu BAD_REQUEST\n", q->id); return 0; }
     int total = tok_encode(tokenizer, q->payload, q->plen, sequence, room);
     const int prompt_tokens = total;
+    if (glm53_text_only_visual_tokens(&m->c,sequence,total)) {
+        free(sequence);
+        serve_line("ERROR %llu BAD_REQUEST\n",q->id);
+        return 0;
+    }
     if (!total) {
         free(sequence);
         serve_line("ERROR %llu EMPTY_PROMPT\n", q->id);
@@ -4953,6 +4980,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--patches and --grid must be used together\n");
         return 2;
     }
+    if (glm53_text_only() && patch_file) {
+        fprintf(stderr,"[GLM53] GLM53_TEXT_ONLY=1 denies --patches before model loading\n");
+        return 2;
+    }
     int capacity = 1024, count = 0;
     int *tokens = malloc((size_t)capacity * sizeof(int));
     Tok tokenizer; int has_tokenizer = 0;
@@ -4982,6 +5013,10 @@ int main(int argc, char **argv) {
     memset(&model, 0, sizeof(model));     /* contatori e puntatori opzionali */
     const double load_start = now_s();
     model_load(&model, dir);
+    if (glm53_text_only_visual_tokens(&model.c,tokens,count)) {
+        fprintf(stderr,"[GLM53] GLM53_TEXT_ONLY=1 denies visual token IDs\n");
+        return 2;
+    }
     glm53_telemetry_init(dir, &model.c);
 #ifdef COLI_VULKAN
     glm53_vk_tier_start(&model);   /* after the history: the warm start reads it */

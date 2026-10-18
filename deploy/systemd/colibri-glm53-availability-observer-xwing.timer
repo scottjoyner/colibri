@@ -1,0 +1,13 @@
+[Unit]
+Description=Sample read-only Colibri GLM53 availability every minute
+
+[Timer]
+OnActiveSec=10s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+RandomizedDelaySec=5s
+Unit=colibri-glm53-availability-observer-xwing.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+{
+  "blockers": [
+    "remote inference endpoint unreachable",
+    "local gateway has no default inference route",
+    "operator-signed model admission, owner-bound fencing and accepted fallback missing"
+  ],
+  "decision": "HOLD",
+  "eligible_for_dispatch": false,
+  "failover_authorized": false,
+  "local_gateway_advertised_route": false,
+  "local_host_healthy": true,
+  "model_loaded_verified": false,
+  "observed_at_utc": "2026-10-18T15:05:29.890651+00:00",
+  "remote_state": "UNREACHABLE"
+}
