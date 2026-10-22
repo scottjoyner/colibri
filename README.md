@@ -1,19 +1,3 @@
-<!-- repo-entrypoint-guide:start -->
-## Repository guide
-
-**Reader guide:** Start with [The idea](#the-idea), [What's implemented](#whats-implemented), [Honest numbers](#honest-numbers-wsl2-12-cores-25-gb-ram-nvme-via-vhdx), and [Download the model](#download-the-model) before copying benchmark figures.
-
-**Benchmark boundaries:** Streaming model weights from SSD changes performance dramatically. Record the exact model/checkpoint, quantization, CPU/GPU, storage bandwidth, cache behavior, prompt/context length, and measured latency for comparable results.
-
-### Find your way
-
-- [See it running](#see-it-running)
-- [Contents](#contents)
-- [The idea](#the-idea)
-- [What's implemented](#whats-implemented)
-- [Honest numbers (WSL2, 12 cores, 25 GB RAM, NVMe via VHDX)](#honest-numbers-wsl2-12-cores-25-gb-ram-nvme-via-vhdx)
-<!-- repo-entrypoint-guide:end -->
-
 <p align="center">
   <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
 </p>
@@ -33,6 +17,23 @@ $ ./coli chat
   ◆ Ciao! 😊 Come posso aiutarti oggi?
 ```
 
+
+
+<!-- repo-entrypoint-guide:start -->
+## Repository guide
+
+**Reader guide:** Start with [The idea](#the-idea), [What's implemented](#whats-implemented), [Honest numbers](#honest-numbers-wsl2-12-cores-25-gb-ram-nvme-via-vhdx), and [Download the model](#download-the-model) before copying benchmark figures.
+
+**Benchmark boundaries:** Streaming model weights from SSD changes performance dramatically. Record the exact model/checkpoint, quantization, CPU/GPU, storage bandwidth, cache behavior, prompt/context length, and measured latency for comparable results.
+
+### Find your way
+
+- [See it running](#see-it-running)
+- [Contents](#contents)
+- [The idea](#the-idea)
+- [What's implemented](#whats-implemented)
+- [Honest numbers (WSL2, 12 cores, 25 GB RAM, NVMe via VHDX)](#honest-numbers-wsl2-12-cores-25-gb-ram-nvme-via-vhdx)
+<!-- repo-entrypoint-guide:end -->
 
 ## See it running
 
